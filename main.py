@@ -18,13 +18,14 @@ STATIC_DIR = BASE_DIR / "static"
 
 from pathlib import Path
 
+app = FastAPI()
+
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
 # Only mount if the folder exists (prevents Render crash)
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
 
 # -------------------------
 # OpenAI client
