@@ -1173,10 +1173,10 @@ def chat_page(request: Request):
     }}
   }});
 
- micBtn.addEventListener("click", () => {
+ micBtn.addEventListener("click", () => {{
   greetOnce();
   preferVoice = true;
-});
+}});
 
   openLoginBtn.addEventListener("click", () => {{
     if (loggedIn) {{
