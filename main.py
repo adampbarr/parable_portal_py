@@ -10,8 +10,8 @@ from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 from pydantic import BaseModel
 
-from db import engine, SessionLocal
-from models import Base, User, LoginState
+from db import engine
+from models import Base
 
 app = FastAPI()
 
@@ -28,6 +28,7 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Mount static (uploads + icons)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
 
 # -------------------------
 # OpenAI client
@@ -303,7 +304,6 @@ def logout_api(request: Request):
 async def upload_image(request: Request, file: UploadFile = File(...)):
     sid = get_sid(request)
 
-    # Require login for uploads (change this if you want free uploads)
     if not is_logged_in(request, sid):
         raise HTTPException(status_code=401, detail="Login required")
 
@@ -316,20 +316,20 @@ async def upload_image(request: Request, file: UploadFile = File(...)):
 
     ext = Path(file.filename).suffix.lower()
     if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic"]:
-        # Keep it simple; you can expand later
         ext = ".jpg"
 
     name = f"{uuid.uuid4().hex}{ext}"
     out_path = UPLOADS_DIR / name
 
     data = await file.read()
-    if len(data) > 8 * 1024 * 1024:  # 8MB
+    if len(data) > 8 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Image too large (max 8MB)")
 
     out_path.write_bytes(data)
 
     full_url = str(request.base_url).rstrip("/") + f"/static/uploads/{name}"
     return {"ok": True, "url": full_url}
+
 
 # -------------------------
 # API endpoints
@@ -351,7 +351,6 @@ def chat_api(payload: ChatIn, request: Request):
 
     m = message.lower() if message else ""
 
-    # Lightweight platform detection
     if "iphone" in m or "ios" in m:
         sess["platform"] = "iphone"
         platform = "iphone"
@@ -380,7 +379,6 @@ def chat_api(payload: ChatIn, request: Request):
             "- End with: 'Did that work?' when appropriate.\n"
         )
 
-        # Make relative image URLs absolute
         if image_url and image_url.startswith("/"):
             image_url = str(request.base_url).rstrip("/") + image_url
 
@@ -416,7 +414,6 @@ def chat_api(payload: ChatIn, request: Request):
 
         answer = resp_ai.output_text or ""
 
-        # Save short history
         if message:
             history.append({"role": "user", "content": message})
         elif image_url:
@@ -813,7 +810,6 @@ def chat_page(request: Request):
   let micReady = false;
   let loggedIn = {str(logged_in).lower()};
 
-  // photo state
   let selectedFile = null;
   let uploadedUrl = null;
 
@@ -842,7 +838,9 @@ def chat_page(request: Request):
     chatbox.appendChild(row);
     chatbox.scrollTop = chatbox.scrollHeight;
 
-    if (who === "bot" && preferVoice === true) speak(text);
+    if (who === "bot" && preferVoice === true) {{
+      speak(text);
+    }}
   }}
 
   function greetOnce() {{
@@ -883,13 +881,19 @@ def chat_page(request: Request):
 
     window.speechSynthesis.cancel();
 
-    if (!selectedVoice) selectedVoice = pickVoice();
+    if (!selectedVoice) {{
+      selectedVoice = pickVoice();
+    }}
 
     let t = (text || "").replace(/\\n+/g, ". ").replace(/\\s+/g, " ").trim();
-    if (t.length > 260) t = t.slice(0, 260) + "...";
+    if (t.length > 260) {{
+      t = t.slice(0, 260) + "...";
+    }}
 
     const u = new SpeechSynthesisUtterance(t);
-    if (selectedVoice) u.voice = selectedVoice;
+    if (selectedVoice) {{
+      u.voice = selectedVoice;
+    }}
     u.rate = 0.98;
     u.pitch = 1.02;
     u.volume = 1.0;
@@ -906,13 +910,17 @@ def chat_page(request: Request):
   async function askMicPermission() {{
     try {{
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
+        micReady = false;
         return false;
       }}
+
       const stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
       stream.getTracks().forEach(track => track.stop());
+
       micReady = true;
       return true;
     }} catch (err) {{
+      console.error("Microphone permission error:", err);
       micReady = false;
       return false;
     }}
@@ -920,15 +928,16 @@ def chat_page(request: Request):
 
   async function startMic() {{
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
     if (!SpeechRecognition) {{
-      addBubble("Voice input is not supported in this browser. Try Chrome or Edge.", "bot");
+      addBubble("Voice input is not supported in this browser.", "bot");
       return;
     }}
 
     if (!micReady) {{
       const ok = await askMicPermission();
       if (!ok) {{
-        addBubble("Microphone permission was blocked. Please allow mic access and try again.", "bot");
+        addBubble("Microphone permission was blocked. Please allow microphone access and try again.", "bot");
         return;
       }}
     }}
@@ -939,29 +948,48 @@ def chat_page(request: Request):
       recognition.interimResults = false;
       recognition.maxAlternatives = 1;
 
-      recognition.onstart = () => {{
+      recognition.onstart = function () {{
         micBtn.disabled = true;
         micBtn.textContent = "🎤 Listening...";
       }};
 
-      recognition.onend = () => {{
+      recognition.onend = function () {{
         micBtn.disabled = false;
         micBtn.textContent = "🎤 Speak";
       }};
 
-      recognition.onerror = () => {{
-        addBubble("Mic error. Check permission and try again.", "bot");
+      recognition.onerror = function (event) {{
+        console.error("Speech recognition error:", event.error);
+
+        let message = "Microphone error. Please try again.";
+
+        if (event.error === "not-allowed") {{
+          message = "Microphone permission was denied. Please allow mic access and try again.";
+          micReady = false;
+        }} else if (event.error === "no-speech") {{
+          message = "I did not hear anything. Try speaking again.";
+        }} else if (event.error === "audio-capture") {{
+          message = "No microphone was found or it is unavailable.";
+        }}
+
+        addBubble(message, "bot");
         micBtn.disabled = false;
         micBtn.textContent = "🎤 Speak";
       }};
 
-      recognition.onresult = (event) => {{
-        input.value = event.results[0][0].transcript;
+      recognition.onresult = function (event) {{
+        const transcript = event.results[0][0].transcript;
+        input.value = transcript;
         send();
       }};
     }}
 
-    recognition.start();
+    try {{
+      recognition.start();
+    }} catch (err) {{
+      console.error("Recognition start error:", err);
+      addBubble("Could not start microphone. Please try again.", "bot");
+    }}
   }}
 
   function showLogin() {{
@@ -1018,7 +1046,6 @@ def chat_page(request: Request):
     }}
   }}
 
-  // Photo UI helpers
   function showPreview(file) {{
     const url = URL.createObjectURL(file);
     previewImg.src = url;
@@ -1070,30 +1097,30 @@ def chat_page(request: Request):
 
     greetOnce();
 
-    // If no message but a photo exists, we still allow sending
     if (!message && !selectedFile) return;
 
-   const label = message || "[Photo sent]";
-addBubble(label, "you");
+    const label = message || "[Photo sent]";
+    addBubble(label, "you");
 
-if (selectedFile) {{
-  const imgRow = document.createElement("div");
-  imgRow.className = "row you";
+    if (selectedFile) {{
+      const imgRow = document.createElement("div");
+      imgRow.className = "row you";
 
-  const img = document.createElement("img");
-  img.src = URL.createObjectURL(selectedFile);
-  img.style.maxWidth = "140px";
-  img.style.maxHeight = "160px";
-  img.style.objectFit = "cover";
-  img.style.borderRadius = "12px";
-  img.style.border = "1px solid #e5e7eb";
-  img.style.cursor = "pointer";
-  img.onclick = () => window.open(img.src, "_blank");
+      const img = document.createElement("img");
+      img.src = URL.createObjectURL(selectedFile);
+      img.style.maxWidth = "140px";
+      img.style.maxHeight = "160px";
+      img.style.objectFit = "cover";
+      img.style.borderRadius = "12px";
+      img.style.border = "1px solid #e5e7eb";
+      img.style.cursor = "pointer";
+      img.onclick = () => window.open(img.src, "_blank");
 
-  imgRow.appendChild(img);
-  chatbox.appendChild(imgRow);
-  chatbox.scrollTop = chatbox.scrollHeight;
-}}
+      imgRow.appendChild(img);
+      chatbox.appendChild(imgRow);
+      chatbox.scrollTop = chatbox.scrollHeight;
+    }}
+
     input.value = "";
     input.focus();
     btn.disabled = true;
@@ -1123,9 +1150,9 @@ if (selectedFile) {{
       const data = await res.json();
       addBubble(data.answer || data.error || ("HTTP " + res.status), "bot");
 
-      // Clear photo after successful send
-      if (photoUrl) clearSelectedPhoto();
-
+      if (photoUrl) {{
+        clearSelectedPhoto();
+      }}
     }} catch (e) {{
       addBubble("Network or server error.", "bot");
     }} finally {{
@@ -1141,7 +1168,9 @@ if (selectedFile) {{
   btn.addEventListener("click", send);
 
   input.addEventListener("keydown", (e) => {{
-    if (e.key === "Enter") send();
+    if (e.key === "Enter") {{
+      send();
+    }}
   }});
 
   micBtn.addEventListener("click", async () => {{
@@ -1162,7 +1191,9 @@ if (selectedFile) {{
   loginClose.addEventListener("click", hideLogin);
 
   loginPass.addEventListener("keydown", (e) => {{
-    if (e.key === "Enter") submitLogin();
+    if (e.key === "Enter") {{
+      submitLogin();
+    }}
   }});
 
   attachBtn.addEventListener("click", () => {{
@@ -1201,4 +1232,3 @@ if (selectedFile) {{
     resp = HTMLResponse(html)
     set_sid_cookie(resp, sid)
     return resp
-  
