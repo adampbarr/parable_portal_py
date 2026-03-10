@@ -1173,11 +1173,10 @@ def chat_page(request: Request):
     }}
   }});
 
-  micBtn.addEventListener("click", async () => {{
-    greetOnce();
-    preferVoice = true;
-    await startMic();
-  }});
+ micBtn.addEventListener("click", () => {
+  greetOnce();
+  preferVoice = true;
+});
 
   openLoginBtn.addEventListener("click", () => {{
     if (loggedIn) {{
@@ -1232,3 +1231,4 @@ def chat_page(request: Request):
     resp = HTMLResponse(html)
     set_sid_cookie(resp, sid)
     return resp
+  
