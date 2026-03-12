@@ -1,32 +1,32 @@
+from __future__ import annotations
+
 import os
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, TypedDict
+from typing import Dict, List, Optional, Tuple, TypedDict
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 from pydantic import BaseModel
 
-from db import engine
-from models import Base
+from db import SessionLocal, engine
+from models import Base, UsageCount
 
 app = FastAPI()
 
-# Create DB tables (Postgres) on startup
+# Create DB tables on startup
 Base.metadata.create_all(bind=engine)
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 UPLOADS_DIR = STATIC_DIR / "uploads"
 
-# Ensure folders exist (safe on Render)
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Mount static (uploads + icons)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -41,7 +41,7 @@ def get_client() -> OpenAI:
 
 
 # -------------------------
-# Session memory (simple)
+# Session memory
 # -------------------------
 class Turn(TypedDict):
     role: str
@@ -62,75 +62,78 @@ def get_session(sid: str) -> Session:
     if not sess:
         sess = {"platform": None, "history": []}
         sessions[sid] = sess
+
     if "platform" not in sess:
         sess["platform"] = None
     if "history" not in sess:
         sess["history"] = []
+
     return sess
 
 
 # -------------------------
-# Server-side FREE limit (2)
+# Free usage limit
 # -------------------------
 MAX_FREE_QUERIES = 2
-_counts: Dict[str, int] = {}  # sid -> count
 
 
 # -------------------------
 # Auth config
 # -------------------------
-APP_USERNAME = os.getenv("PARABLE_USERNAME", "admin")
-APP_PASSWORD = os.getenv("PARABLE_PASSWORD", "password")
+APP_USERNAME = os.getenv("PARABLE_USERNAME")
+APP_PASSWORD = os.getenv("PARABLE_PASSWORD")
+
+if not APP_USERNAME or not APP_PASSWORD:
+    raise RuntimeError("PARABLE_USERNAME and PARABLE_PASSWORD must be set")
 
 MAX_LOGIN_ATTEMPTS = 3
 LOCKOUT_SECONDS = 30 * 60  # 30 minutes
 
-_login_attempts: Dict[str, int] = {}    # sid -> failed attempts
-_login_lockouts: Dict[str, float] = {}  # sid -> unlock timestamp
+_login_attempts: Dict[str, int] = {}
+_login_lockouts: Dict[str, float] = {}
 
-# Keep an in-memory list of authenticated SIDs (works even when cookies are blocked)
 AUTH_TTL_SECONDS = 60 * 60 * 24 * 7  # 7 days
-_authed_sids: Dict[str, float] = {}  # sid -> expires_at
+_authed_sids: Dict[str, float] = {}
 
 
 # -------------------------
-# Cookies (Squarespace/WebView-friendly)
+# Cookie helpers
 # -------------------------
-def set_sid_cookie(resp, sid: str) -> None:
+def set_sid_cookie(resp: JSONResponse | HTMLResponse, sid: str) -> None:
     resp.set_cookie(
         key="sid",
         value=sid,
         httponly=True,
         secure=True,
-        samesite="none",
+        samesite="lax",
         path="/",
-        max_age=60 * 60 * 24 * 30,  # 30 days
+        max_age=60 * 60 * 24 * 30,
     )
 
 
-def set_auth_cookie(resp) -> None:
+def set_auth_cookie(resp: JSONResponse | HTMLResponse) -> None:
     resp.set_cookie(
         key="parable_auth",
         value="1",
         httponly=True,
         secure=True,
-        samesite="none",
+        samesite="lax",
         path="/",
-        max_age=60 * 60 * 24 * 7,  # 7 days
+        max_age=AUTH_TTL_SECONDS,
     )
 
 
-def clear_auth_cookie(resp) -> None:
+def clear_auth_cookie(resp: JSONResponse | HTMLResponse) -> None:
     resp.delete_cookie(
         key="parable_auth",
         path="/",
-        samesite="none",
+        samesite="lax",
         secure=True,
     )
 
 
 # -------------------------
-# SID resolver (works with cookies blocked)
+# SID resolver
 # -------------------------
 def get_sid(request: Request) -> str:
     sid = request.headers.get("x-parable-sid")
@@ -145,38 +148,86 @@ def get_sid(request: Request) -> str:
 
 
 # -------------------------
-# Logged-in check (cookie OR authed SID)
+# Logged-in helpers
 # -------------------------
 def _sid_is_authed(sid: str) -> bool:
     exp = _authed_sids.get(sid)
     if not exp:
         return False
+
     if exp <= time.time():
         _authed_sids.pop(sid, None)
         return False
+
     return True
 
 
 def is_logged_in(request: Request, sid: str) -> bool:
-    if request.cookies.get("parable_auth") == "1":
-        return True
-    return _sid_is_authed(sid)
+    cookie_ok = request.cookies.get("parable_auth") == "1"
+    return cookie_ok and _sid_is_authed(sid)
+
+
+def mark_sid_authed(sid: str) -> None:
+    _authed_sids[sid] = time.time() + AUTH_TTL_SECONDS
+
+
+def unmark_sid_authed(sid: str) -> None:
+    _authed_sids.pop(sid, None)
+
+
+# -------------------------
+# Usage count helpers (DB-backed)
+# -------------------------
+def get_usage_key(request: Request, sid: str) -> str:
+    if is_logged_in(request, sid):
+        return f"user:{APP_USERNAME}"
+    return f"sid:{sid}"
+
+
+def get_query_count(key: str) -> int:
+    db = SessionLocal()
+    try:
+        row = db.query(UsageCount).filter(UsageCount.key == key).first()
+        return row.count if row else 0
+    finally:
+        db.close()
+
+
+def increment_query_count(key: str) -> int:
+    db = SessionLocal()
+    try:
+        row = db.query(UsageCount).filter(UsageCount.key == key).first()
+
+        if not row:
+            row = UsageCount(key=key, count=1)
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return row.count
+
+        row.count += 1
+        db.commit()
+        db.refresh(row)
+        return row.count
+    finally:
+        db.close()
 
 
 def enforce_free_limit(sid: str, request: Request) -> None:
     if is_logged_in(request, sid):
         return
 
-    c = _counts.get(sid, 0) + 1
-    _counts[sid] = c
-    if c > MAX_FREE_QUERIES:
+    key = get_usage_key(request, sid)
+    count = increment_query_count(key)
+
+    if count > MAX_FREE_QUERIES:
         raise HTTPException(status_code=402, detail="Login required")
 
 
 # -------------------------
 # Lockout helpers
 # -------------------------
-def is_locked_out(sid: str) -> tuple[bool, int]:
+def is_locked_out(sid: str) -> Tuple[bool, int]:
     unlock_at = _login_lockouts.get(sid)
     if not unlock_at:
         return False, 0
@@ -190,7 +241,7 @@ def is_locked_out(sid: str) -> tuple[bool, int]:
     return True, remaining
 
 
-def register_failed_login(sid: str) -> tuple[int, bool, int]:
+def register_failed_login(sid: str) -> Tuple[int, bool, int]:
     attempts = _login_attempts.get(sid, 0) + 1
     _login_attempts[sid] = attempts
 
@@ -208,14 +259,6 @@ def reset_login_attempts(sid: str) -> None:
     _login_lockouts.pop(sid, None)
 
 
-def mark_sid_authed(sid: str) -> None:
-    _authed_sids[sid] = time.time() + AUTH_TTL_SECONDS
-
-
-def unmark_sid_authed(sid: str) -> None:
-    _authed_sids.pop(sid, None)
-
-
 # -------------------------
 # API models
 # -------------------------
@@ -230,7 +273,7 @@ class LoginIn(BaseModel):
 
 
 # -------------------------
-# PWA manifest
+# Manifest
 # -------------------------
 @app.get("/manifest.webmanifest")
 def manifest():
@@ -253,7 +296,10 @@ def login_api(payload: LoginIn, request: Request):
     if locked:
         minutes = max(1, remaining // 60)
         resp = JSONResponse(
-            {"ok": False, "error": f"Too many wrong tries. Try again in about {minutes} minutes."},
+            {
+                "ok": False,
+                "error": f"Too many wrong tries. Try again in about {minutes} minutes.",
+            },
             status_code=429,
         )
         set_sid_cookie(resp, sid)
@@ -262,6 +308,7 @@ def login_api(payload: LoginIn, request: Request):
     if username == APP_USERNAME and password == APP_PASSWORD:
         reset_login_attempts(sid)
         mark_sid_authed(sid)
+
         resp = JSONResponse({"ok": True, "message": "Logged in"})
         set_sid_cookie(resp, sid)
         set_auth_cookie(resp)
@@ -272,7 +319,10 @@ def login_api(payload: LoginIn, request: Request):
     if locked_now:
         minutes = max(1, remaining // 60)
         resp = JSONResponse(
-            {"ok": False, "error": f"Too many wrong tries. Login locked for about {minutes} minutes."},
+            {
+                "ok": False,
+                "error": f"Too many wrong tries. Login locked for about {minutes} minutes.",
+            },
             status_code=429,
         )
         set_sid_cookie(resp, sid)
@@ -280,7 +330,10 @@ def login_api(payload: LoginIn, request: Request):
 
     tries_left = MAX_LOGIN_ATTEMPTS - attempts
     resp = JSONResponse(
-        {"ok": False, "error": f"Wrong username or password. {tries_left} attempt(s) left."},
+        {
+            "ok": False,
+            "error": f"Wrong username or password. {tries_left} attempt(s) left.",
+        },
         status_code=401,
     )
     set_sid_cookie(resp, sid)
@@ -291,14 +344,35 @@ def login_api(payload: LoginIn, request: Request):
 def logout_api(request: Request):
     sid = get_sid(request)
     unmark_sid_authed(sid)
+
     resp = JSONResponse({"ok": True})
     set_sid_cookie(resp, sid)
     clear_auth_cookie(resp)
     return resp
 
 
+@app.get("/api/me")
+def me_api(request: Request):
+    sid = get_sid(request)
+    logged_in = is_logged_in(request, sid)
+    usage_key = get_usage_key(request, sid)
+    used = get_query_count(usage_key)
+
+    resp = JSONResponse(
+        {
+            "ok": True,
+            "logged_in": logged_in,
+            "used_count": used,
+            "free_limit": MAX_FREE_QUERIES,
+            "remaining_free": max(0, MAX_FREE_QUERIES - used),
+        }
+    )
+    set_sid_cookie(resp, sid)
+    return resp
+
+
 # -------------------------
-# Upload endpoint (images)
+# Upload endpoint
 # -------------------------
 @app.post("/api/upload-image")
 async def upload_image(request: Request, file: UploadFile = File(...)):
@@ -310,29 +384,28 @@ async def upload_image(request: Request, file: UploadFile = File(...)):
     if not file or not file.filename:
         raise HTTPException(status_code=400, detail="file required")
 
-    ct = (file.content_type or "").lower()
-    if not ct.startswith("image/"):
+    content_type = (file.content_type or "").lower()
+    if not content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image uploads are allowed")
 
     ext = Path(file.filename).suffix.lower()
-    if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic"]:
+    if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
         ext = ".jpg"
-
-    name = f"{uuid.uuid4().hex}{ext}"
-    out_path = UPLOADS_DIR / name
 
     data = await file.read()
     if len(data) > 8 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Image too large (max 8MB)")
 
+    filename = f"{uuid.uuid4().hex}{ext}"
+    out_path = UPLOADS_DIR / filename
     out_path.write_bytes(data)
 
-    full_url = str(request.base_url).rstrip("/") + f"/static/uploads/{name}"
+    full_url = str(request.base_url).rstrip("/") + f"/static/uploads/{filename}"
     return {"ok": True, "url": full_url}
 
 
 # -------------------------
-# API endpoints
+# Chat endpoint
 # -------------------------
 @app.post("/api/chat")
 def chat_api(payload: ChatIn, request: Request):
@@ -345,16 +418,20 @@ def chat_api(payload: ChatIn, request: Request):
     sid = get_sid(request)
     enforce_free_limit(sid, request)
 
+    usage_key = get_usage_key(request, sid)
+    used_count = get_query_count(usage_key)
+
     sess = get_session(sid)
     history = sess["history"]
     platform = sess["platform"]
 
-    m = message.lower() if message else ""
+    lower_message = message.lower() if message else ""
 
-    if "iphone" in m or "ios" in m:
+    if "iphone" in lower_message or "ios" in lower_message:
         sess["platform"] = "iphone"
         platform = "iphone"
-    if "android" in m:
+
+    if "android" in lower_message:
         sess["platform"] = "android"
         platform = "android"
 
@@ -363,18 +440,17 @@ def chat_api(payload: ChatIn, request: Request):
             "You are Parable Smartphone Support. Talk like a calm, friendly helper.\n"
             "Rules:\n"
             "- Use simple words. No tech jargon.\n"
-            "- Keep it short: 3–6 steps max.\n"
+            "- Keep it short: 3 to 6 steps max.\n"
             "- One step per line. Start each line with a verb: Tap, Open, Turn on, Turn off, Go to, Try, Restart.\n"
-            "- Ask at most ONE question, only if needed.\n"
+            "- Ask at most one question, only if needed.\n"
             "- If you mention a setting, include the exact path like: Settings > Accessibility > Zoom.\n"
             "- Avoid acronyms. If you must use one, explain it in 3 words.\n"
-            "- If scams/pop-ups: start with 'Don’t click anything.'\n"
+            "- If scams or pop-ups: start with 'Don't click anything.'\n"
             "\n"
-            "If a photo is provided, you MUST do this structure:\n"
-            "1) Start with: 'What I see in your screenshot:' and list 3–6 bullets of exact visible details.\n"
-            "   - Include any sender name/number, website link, app name, warning text, or buttons if visible.\n"
-            "2) Then: 'Is it suspicious?' and answer Yes/No with one sentence why.\n"
-            "3) Then give 3–6 safe steps the user should do next.\n"
+            "If a photo is provided, do this structure:\n"
+            "1) Start with: 'What I see in your screenshot:' and list 3 to 6 bullets of exact visible details.\n"
+            "2) Then: 'Is it suspicious?' and answer Yes or No with one sentence why.\n"
+            "3) Then give 3 to 6 safe steps the user should do next.\n"
             "- If the screenshot is unreadable, say so and ask them to upload a clearer one.\n"
             "- End with: 'Did that work?' when appropriate.\n"
         )
@@ -389,7 +465,9 @@ def chat_api(payload: ChatIn, request: Request):
         input_messages: List[dict] = [{"role": "system", "content": system_text}]
 
         if platform:
-            input_messages.append({"role": "system", "content": f"User is on {platform}."})
+            input_messages.append(
+                {"role": "system", "content": f"User is on {platform}."}
+            )
 
         for turn in history[-MAX_HISTORY:]:
             input_messages.append(turn)
@@ -407,28 +485,40 @@ def chat_api(payload: ChatIn, request: Request):
         else:
             input_messages.append({"role": "user", "content": user_text})
 
-        resp_ai = get_client().responses.create(
+        ai_response = get_client().responses.create(
             model="gpt-4.1-mini",
             input=input_messages,
         )
 
-        answer = resp_ai.output_text or ""
+        answer = ai_response.output_text or ""
 
         if message:
             history.append({"role": "user", "content": message})
         elif image_url:
             history.append({"role": "user", "content": "[Uploaded a photo]"})
+
         history.append({"role": "assistant", "content": answer})
         sess["history"] = history[-MAX_HISTORY:]
 
-        resp = JSONResponse({"answer": answer})
+        resp = JSONResponse(
+            {
+                "answer": answer,
+                "logged_in": is_logged_in(request, sid),
+                "used_count": used_count,
+                "free_limit": MAX_FREE_QUERIES,
+                "remaining_free": max(0, MAX_FREE_QUERIES - used_count),
+            }
+        )
         set_sid_cookie(resp, sid)
         return resp
 
     except HTTPException:
         raise
-    except Exception as e:
-        resp = JSONResponse({"error": f"AI service error: {str(e)}"}, status_code=502)
+    except Exception:
+        resp = JSONResponse(
+            {"error": "AI service error. Please try again."},
+            status_code=502,
+        )
         set_sid_cookie(resp, sid)
         return resp
 
@@ -736,11 +826,13 @@ def chat_page(request: Request):
         </div>
       </div>
 
+      <div id="usageStatus" class="status" style="margin-bottom:10px;"></div>
+
       <div id="chatbox" class="chatbox"></div>
 
       <div class="quick">
-        <button class="q" type="button" onclick="quick('iPhone')">I’m on iPhone</button>
-        <button class="q" type="button" onclick="quick('Android')">I’m on Android</button>
+        <button class="q" type="button" onclick="quick('iPhone')">I'm on iPhone</button>
+        <button class="q" type="button" onclick="quick('Android')">I'm on Android</button>
       </div>
 
       <div id="preview" class="preview">
@@ -787,6 +879,7 @@ def chat_page(request: Request):
   const btn = document.getElementById("btn");
   const micBtn = document.getElementById("mic");
   const card = document.getElementById("card");
+  const usageStatus = document.getElementById("usageStatus");
 
   const attachBtn = document.getElementById("attach");
   const photoInput = document.getElementById("photoInput");
@@ -824,6 +917,36 @@ def chat_page(request: Request):
       localStorage.setItem(key, sid);
     }}
     return sid;
+  }}
+
+  function updateUsageUi(data) {{
+    if (!data) return;
+
+    if (data.logged_in) {{
+      usageStatus.textContent = "Logged in account active.";
+      return;
+    }}
+
+    usageStatus.textContent = `Free questions left: ${{Math.max(0, data.remaining_free)}} of ${{data.free_limit}}`;
+  }}
+
+  async function loadUsage() {{
+    try {{
+      const res = await fetch("/api/me", {{
+        headers: {{
+          "X-Parable-SID": getOrCreateSid()
+        }},
+        credentials: "same-origin"
+      }});
+      const data = await res.json();
+      if (res.ok) {{
+        loggedIn = data.logged_in;
+        updateLoginUi();
+        updateUsageUi(data);
+      }}
+    }} catch (e) {{
+      console.error("Usage load failed", e);
+    }}
   }}
 
   function addBubble(text, who) {{
@@ -1041,6 +1164,7 @@ def chat_page(request: Request):
       hideLogin();
       addBubble("You are logged in. You can keep chatting now.", "bot");
       loginPass.value = "";
+      loadUsage();
     }} catch (e) {{
       loginError.textContent = "Login error. Try again.";
     }}
@@ -1144,11 +1268,13 @@ def chat_page(request: Request):
       if (res.status === 402) {{
         addBubble("Free limit reached — please log in to continue.", "bot");
         showLogin();
+        loadUsage();
         return;
       }}
 
       const data = await res.json();
       addBubble(data.answer || data.error || ("HTTP " + res.status), "bot");
+      updateUsageUi(data);
 
       if (photoUrl) {{
         clearSelectedPhoto();
@@ -1173,10 +1299,11 @@ def chat_page(request: Request):
     }}
   }});
 
- micBtn.addEventListener("click", () => {{
-  greetOnce();
-  preferVoice = true;
-}});
+  micBtn.addEventListener("click", async () => {{
+    greetOnce();
+    preferVoice = true;
+    await startMic();
+  }});
 
   openLoginBtn.addEventListener("click", () => {{
     if (loggedIn) {{
@@ -1218,6 +1345,7 @@ def chat_page(request: Request):
   window.addEventListener("load", () => {{
     updateLoginUi();
     greetOnce();
+    loadUsage();
   }});
 
   if ("serviceWorker" in navigator) {{
