@@ -12,8 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 from pydantic import BaseModel
 
-from db import SessionLocal, engine
-from models import Base, UsageCount
+from db import Base, SessionLocal, engine
+from models import UsageCount
 
 app = FastAPI()
 
