@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 import uuid
@@ -7,13 +8,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TypedDict
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from db import Base, SessionLocal, engine
-from models import UsageCount
+from db import Base, engine
 
 app = FastAPI()
 
@@ -28,6 +29,111 @@ STATIC_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# -------------------------
+# Logging
+# -------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+logger = logging.getLogger("parable")
+
+
+# -------------------------
+# Helpers / config
+# -------------------------
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+COOKIE_SECURE = env_bool("COOKIE_SECURE", True)
+MAX_HISTORY = 8
+MAX_MESSAGE_LENGTH = 1500
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024  # 8 MB
+
+STATE_CLEANUP_INTERVAL_SECONDS = 15 * 60
+_last_cleanup_at = 0.0
+
+
+def now_ts() -> float:
+    return time.time()
+
+
+def maybe_cleanup_state() -> None:
+    global _last_cleanup_at
+
+    now = now_ts()
+    if now - _last_cleanup_at < STATE_CLEANUP_INTERVAL_SECONDS:
+        return
+
+    _last_cleanup_at = now
+
+    # Clean expired auth sessions
+    expired_auth = [sid for sid, exp in _authed_sids.items() if exp <= now]
+    for sid in expired_auth:
+        _authed_sids.pop(sid, None)
+
+    # Clean expired login lockouts
+    expired_lockouts = [key for key, unlock_at in _login_lockouts.items() if unlock_at <= now]
+    for key in expired_lockouts:
+        _login_lockouts.pop(key, None)
+        _login_attempts.pop(key, None)
+
+    # Clean expired rate limit windows
+    for bucket in (_chat_rate_windows, _upload_rate_windows):
+        stale_keys = []
+        for key, timestamps in bucket.items():
+            fresh = [ts for ts in timestamps if now - ts <= 3600]
+            if fresh:
+                bucket[key] = fresh
+            else:
+                stale_keys.append(key)
+        for key in stale_keys:
+            bucket.pop(key, None)
+
+    # Clean very old sessions
+    stale_sessions = [sid for sid, sess in sessions.items() if now - sess.get("last_seen", now) > 7 * 24 * 3600]
+    for sid in stale_sessions:
+        sessions.pop(sid, None)
+
+    logger.info(
+        "State cleanup complete | expired_auth=%s expired_lockouts=%s stale_sessions=%s",
+        len(expired_auth),
+        len(expired_lockouts),
+        len(stale_sessions),
+    )
+
+
+def is_api_path(path: str) -> bool:
+    return path.startswith("/api/")
+
+
+def api_error(message: str, status_code: int) -> JSONResponse:
+    return JSONResponse({"ok": False, "error": message}, status_code=status_code)
+
+
+def get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    return request.client.host if request.client else "unknown"
+
+
+def is_reasonable_sid(sid: str) -> bool:
+    if not sid:
+        return False
+    if len(sid) < 10 or len(sid) > 128:
+        return False
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+    return all(ch in allowed for ch in sid)
 
 
 # -------------------------
@@ -51,30 +157,25 @@ class Turn(TypedDict):
 class Session(TypedDict):
     platform: Optional[str]
     history: List[Turn]
+    last_seen: float
 
 
 sessions: Dict[str, Session] = {}
-MAX_HISTORY = 8
 
 
 def get_session(sid: str) -> Session:
     sess = sessions.get(sid)
     if not sess:
-        sess = {"platform": None, "history": []}
+        sess = {"platform": None, "history": [], "last_seen": now_ts()}
         sessions[sid] = sess
 
     if "platform" not in sess:
         sess["platform"] = None
     if "history" not in sess:
         sess["history"] = []
+    sess["last_seen"] = now_ts()
 
     return sess
-
-
-# -------------------------
-# Free usage limit
-# -------------------------
-MAX_FREE_QUERIES = 2
 
 
 # -------------------------
@@ -88,47 +189,87 @@ if not APP_USERNAME or not APP_PASSWORD:
 
 MAX_LOGIN_ATTEMPTS = 3
 LOCKOUT_SECONDS = 30 * 60  # 30 minutes
+AUTH_TTL_SECONDS = 60 * 60 * 24 * 7  # 7 days
 
 _login_attempts: Dict[str, int] = {}
 _login_lockouts: Dict[str, float] = {}
-
-AUTH_TTL_SECONDS = 60 * 60 * 24 * 7  # 7 days
 _authed_sids: Dict[str, float] = {}
+
+
+# -------------------------
+# Simple in-memory rate limiting
+# -------------------------
+CHAT_RATE_LIMIT_COUNT = 20
+CHAT_RATE_LIMIT_WINDOW_SECONDS = 5 * 60
+
+UPLOAD_RATE_LIMIT_COUNT = 10
+UPLOAD_RATE_LIMIT_WINDOW_SECONDS = 10 * 60
+
+_chat_rate_windows: Dict[str, List[float]] = {}
+_upload_rate_windows: Dict[str, List[float]] = {}
+
+
+def rate_limit_check(
+    bucket: Dict[str, List[float]],
+    key: str,
+    max_count: int,
+    window_seconds: int,
+) -> Tuple[bool, int]:
+    now = now_ts()
+    history = bucket.get(key, [])
+    history = [ts for ts in history if now - ts <= window_seconds]
+
+    if len(history) >= max_count:
+        retry_after = max(1, int(window_seconds - (now - history[0])))
+        bucket[key] = history
+        return False, retry_after
+
+    history.append(now)
+    bucket[key] = history
+    return True, 0
+
+
+def get_login_key(request: Request, sid: str) -> str:
+    return f"{get_client_ip(request)}:{sid}"
+
+
+def get_rate_key(request: Request, sid: str) -> str:
+    return f"{get_client_ip(request)}:{sid}"
 
 
 # -------------------------
 # Cookie helpers
 # -------------------------
-def set_sid_cookie(resp: JSONResponse | HTMLResponse, sid: str) -> None:
+def set_sid_cookie(resp: JSONResponse | HTMLResponse | RedirectResponse, sid: str) -> None:
     resp.set_cookie(
         key="sid",
         value=sid,
         httponly=True,
-        secure=True,
+        secure=COOKIE_SECURE,
         samesite="lax",
         path="/",
         max_age=60 * 60 * 24 * 30,
     )
 
 
-def set_auth_cookie(resp: JSONResponse | HTMLResponse) -> None:
+def set_auth_cookie(resp: JSONResponse | HTMLResponse | RedirectResponse) -> None:
     resp.set_cookie(
         key="parable_auth",
         value="1",
         httponly=True,
-        secure=True,
+        secure=COOKIE_SECURE,
         samesite="lax",
         path="/",
         max_age=AUTH_TTL_SECONDS,
     )
 
 
-def clear_auth_cookie(resp: JSONResponse | HTMLResponse) -> None:
+def clear_auth_cookie(resp: JSONResponse | HTMLResponse | RedirectResponse) -> None:
     resp.delete_cookie(
         key="parable_auth",
         path="/",
         samesite="lax",
-        secure=True,
+        secure=COOKIE_SECURE,
     )
 
 
@@ -136,15 +277,15 @@ def clear_auth_cookie(resp: JSONResponse | HTMLResponse) -> None:
 # SID resolver
 # -------------------------
 def get_sid(request: Request) -> str:
-    sid = request.headers.get("x-parable-sid")
-    if sid and len(sid) >= 10:
-        return sid
+    header_sid = request.headers.get("x-parable-sid", "").strip()
+    if is_reasonable_sid(header_sid):
+        return header_sid
 
-    sid = request.cookies.get("sid")
-    if sid and len(sid) >= 10:
-        return sid
+    cookie_sid = (request.cookies.get("sid") or "").strip()
+    if is_reasonable_sid(cookie_sid):
+        return cookie_sid
 
-    return str(uuid.uuid4())
+    return uuid.uuid4().hex
 
 
 # -------------------------
@@ -155,7 +296,7 @@ def _sid_is_authed(sid: str) -> bool:
     if not exp:
         return False
 
-    if exp <= time.time():
+    if exp <= now_ts():
         _authed_sids.pop(sid, None)
         return False
 
@@ -168,7 +309,7 @@ def is_logged_in(request: Request, sid: str) -> bool:
 
 
 def mark_sid_authed(sid: str) -> None:
-    _authed_sids[sid] = time.time() + AUTH_TTL_SECONDS
+    _authed_sids[sid] = now_ts() + AUTH_TTL_SECONDS
 
 
 def unmark_sid_authed(sid: str) -> None:
@@ -176,100 +317,100 @@ def unmark_sid_authed(sid: str) -> None:
 
 
 # -------------------------
-# Usage count helpers (DB-backed)
-# -------------------------
-def get_usage_key(request: Request, sid: str) -> str:
-    if is_logged_in(request, sid):
-        return f"user:{APP_USERNAME}"
-    return f"sid:{sid}"
-
-
-def get_query_count(key: str) -> int:
-    db = SessionLocal()
-    try:
-        row = db.query(UsageCount).filter(UsageCount.key == key).first()
-        return row.count if row else 0
-    finally:
-        db.close()
-
-
-def increment_query_count(key: str) -> int:
-    db = SessionLocal()
-    try:
-        row = db.query(UsageCount).filter(UsageCount.key == key).first()
-
-        if not row:
-            row = UsageCount(key=key, count=1)
-            db.add(row)
-            db.commit()
-            db.refresh(row)
-            return row.count
-
-        row.count += 1
-        db.commit()
-        db.refresh(row)
-        return row.count
-    finally:
-        db.close()
-
-
-def enforce_free_limit(sid: str, request: Request) -> None:
-    if is_logged_in(request, sid):
-        return
-
-    key = get_usage_key(request, sid)
-    count = increment_query_count(key)
-
-    if count > MAX_FREE_QUERIES:
-        raise HTTPException(status_code=402, detail="Login required")
-
-
-# -------------------------
 # Lockout helpers
 # -------------------------
-def is_locked_out(sid: str) -> Tuple[bool, int]:
-    unlock_at = _login_lockouts.get(sid)
+def is_locked_out(login_key: str) -> Tuple[bool, int]:
+    unlock_at = _login_lockouts.get(login_key)
     if not unlock_at:
         return False, 0
 
-    remaining = int(unlock_at - time.time())
+    remaining = int(unlock_at - now_ts())
     if remaining <= 0:
-        _login_lockouts.pop(sid, None)
-        _login_attempts.pop(sid, None)
+        _login_lockouts.pop(login_key, None)
+        _login_attempts.pop(login_key, None)
         return False, 0
 
     return True, remaining
 
 
-def register_failed_login(sid: str) -> Tuple[int, bool, int]:
-    attempts = _login_attempts.get(sid, 0) + 1
-    _login_attempts[sid] = attempts
+def register_failed_login(login_key: str) -> Tuple[int, bool, int]:
+    attempts = _login_attempts.get(login_key, 0) + 1
+    _login_attempts[login_key] = attempts
 
     if attempts >= MAX_LOGIN_ATTEMPTS:
-        unlock_at = time.time() + LOCKOUT_SECONDS
-        _login_lockouts[sid] = unlock_at
-        remaining = int(unlock_at - time.time())
+        unlock_at = now_ts() + LOCKOUT_SECONDS
+        _login_lockouts[login_key] = unlock_at
+        remaining = int(unlock_at - now_ts())
         return attempts, True, remaining
 
     return attempts, False, 0
 
 
-def reset_login_attempts(sid: str) -> None:
-    _login_attempts.pop(sid, None)
-    _login_lockouts.pop(sid, None)
+def reset_login_attempts(login_key: str) -> None:
+    _login_attempts.pop(login_key, None)
+    _login_lockouts.pop(login_key, None)
 
 
 # -------------------------
 # API models
 # -------------------------
 class ChatIn(BaseModel):
-    message: str
+    message: str = Field(default="", max_length=MAX_MESSAGE_LENGTH)
     image_url: Optional[str] = None
 
 
 class LoginIn(BaseModel):
-    username: str
-    password: str
+    username: str = Field(..., min_length=1, max_length=128)
+    password: str = Field(..., min_length=1, max_length=256)
+
+
+# -------------------------
+# Middleware
+# -------------------------
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    maybe_cleanup_state()
+    response = await call_next(request)
+
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["Permissions-Policy"] = "microphone=(self), camera=(), geolocation=()"
+    response.headers["Cache-Control"] = "no-store" if is_api_path(request.url.path) else "public, max-age=300"
+
+    return response
+
+
+# -------------------------
+# Exception handlers
+# -------------------------
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.warning("Validation error | path=%s | detail=%s", request.url.path, exc.errors())
+    if is_api_path(request.url.path):
+        return api_error("Invalid request.", 422)
+    return HTMLResponse("<h1>Invalid request</h1>", status_code=422)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail if isinstance(exc.detail, str) else "Request failed."
+    if exc.status_code >= 500:
+        logger.error("HTTPException | path=%s | status=%s | detail=%s", request.url.path, exc.status_code, detail)
+    else:
+        logger.info("HTTPException | path=%s | status=%s | detail=%s", request.url.path, exc.status_code, detail)
+
+    if is_api_path(request.url.path):
+        return api_error(detail, exc.status_code)
+    return HTMLResponse(f"<h1>{detail}</h1>", status_code=exc.status_code)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error | path=%s", request.url.path)
+    if is_api_path(request.url.path):
+        return api_error("Something went wrong. Please try again.", 500)
+    return HTMLResponse("<h1>Something went wrong. Please try again.</h1>", status_code=500)
 
 
 # -------------------------
@@ -277,8 +418,11 @@ class LoginIn(BaseModel):
 # -------------------------
 @app.get("/manifest.webmanifest")
 def manifest():
+    manifest_path = BASE_DIR / "manifest.webmanifest"
+    if not manifest_path.exists():
+        raise HTTPException(status_code=404, detail="Manifest not found")
     return FileResponse(
-        str(BASE_DIR / "manifest.webmanifest"),
+        str(manifest_path),
         media_type="application/manifest+json",
     )
 
@@ -291,10 +435,12 @@ def login_api(payload: LoginIn, request: Request):
     username = (payload.username or "").strip()
     password = payload.password or ""
     sid = get_sid(request)
+    login_key = get_login_key(request, sid)
 
-    locked, remaining = is_locked_out(sid)
+    locked, remaining = is_locked_out(login_key)
     if locked:
         minutes = max(1, remaining // 60)
+        logger.warning("Login blocked | sid=%s ip=%s remaining=%ss", sid, get_client_ip(request), remaining)
         resp = JSONResponse(
             {
                 "ok": False,
@@ -306,15 +452,30 @@ def login_api(payload: LoginIn, request: Request):
         return resp
 
     if username == APP_USERNAME and password == APP_PASSWORD:
-        reset_login_attempts(sid)
+        reset_login_attempts(login_key)
         mark_sid_authed(sid)
 
-        resp = JSONResponse({"ok": True, "message": "Logged in"})
+        logger.info("Login success | sid=%s ip=%s", sid, get_client_ip(request))
+
+        resp = JSONResponse(
+            {
+                "ok": True,
+                "message": "Logged in",
+                "redirect": "/chat",
+            }
+        )
         set_sid_cookie(resp, sid)
         set_auth_cookie(resp)
         return resp
 
-    attempts, locked_now, remaining = register_failed_login(sid)
+    attempts, locked_now, remaining = register_failed_login(login_key)
+    logger.warning(
+        "Login failed | sid=%s ip=%s attempts=%s locked_now=%s",
+        sid,
+        get_client_ip(request),
+        attempts,
+        locked_now,
+    )
 
     if locked_now:
         minutes = max(1, remaining // 60)
@@ -345,6 +506,8 @@ def logout_api(request: Request):
     sid = get_sid(request)
     unmark_sid_authed(sid)
 
+    logger.info("Logout | sid=%s ip=%s", sid, get_client_ip(request))
+
     resp = JSONResponse({"ok": True})
     set_sid_cookie(resp, sid)
     clear_auth_cookie(resp)
@@ -355,16 +518,11 @@ def logout_api(request: Request):
 def me_api(request: Request):
     sid = get_sid(request)
     logged_in = is_logged_in(request, sid)
-    usage_key = get_usage_key(request, sid)
-    used = get_query_count(usage_key)
 
     resp = JSONResponse(
         {
             "ok": True,
             "logged_in": logged_in,
-            "used_count": used,
-            "free_limit": MAX_FREE_QUERIES,
-            "remaining_free": max(0, MAX_FREE_QUERIES - used),
         }
     )
     set_sid_cookie(resp, sid)
@@ -381,8 +539,20 @@ async def upload_image(request: Request, file: UploadFile = File(...)):
     if not is_logged_in(request, sid):
         raise HTTPException(status_code=401, detail="Login required")
 
+    allowed, retry_after = rate_limit_check(
+        _upload_rate_windows,
+        get_rate_key(request, sid),
+        UPLOAD_RATE_LIMIT_COUNT,
+        UPLOAD_RATE_LIMIT_WINDOW_SECONDS,
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many uploads. Please wait about {retry_after} seconds and try again.",
+        )
+
     if not file or not file.filename:
-        raise HTTPException(status_code=400, detail="file required")
+        raise HTTPException(status_code=400, detail="File required")
 
     content_type = (file.content_type or "").lower()
     if not content_type.startswith("image/"):
@@ -393,7 +563,10 @@ async def upload_image(request: Request, file: UploadFile = File(...)):
         ext = ".jpg"
 
     data = await file.read()
-    if len(data) > 8 * 1024 * 1024:
+    if not data:
+        raise HTTPException(status_code=400, detail="File was empty")
+
+    if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Image too large (max 8MB)")
 
     filename = f"{uuid.uuid4().hex}{ext}"
@@ -401,6 +574,13 @@ async def upload_image(request: Request, file: UploadFile = File(...)):
     out_path.write_bytes(data)
 
     full_url = str(request.base_url).rstrip("/") + f"/static/uploads/{filename}"
+    logger.info(
+        "Image uploaded | sid=%s ip=%s file=%s bytes=%s",
+        sid,
+        get_client_ip(request),
+        filename,
+        len(data),
+    )
     return {"ok": True, "url": full_url}
 
 
@@ -409,19 +589,36 @@ async def upload_image(request: Request, file: UploadFile = File(...)):
 # -------------------------
 @app.post("/api/chat")
 def chat_api(payload: ChatIn, request: Request):
+    sid = get_sid(request)
+    sess = get_session(sid)
+
     message = (payload.message or "").strip()
     image_url = (payload.image_url or "").strip() or None
 
     if not message and not image_url:
-        return JSONResponse({"error": "message or image required"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "Message or image required."}, status_code=400)
 
-    sid = get_sid(request)
-    enforce_free_limit(sid, request)
+    if len(message) > MAX_MESSAGE_LENGTH:
+        return JSONResponse(
+            {"ok": False, "error": f"Message is too long. Keep it under {MAX_MESSAGE_LENGTH} characters."},
+            status_code=400,
+        )
 
-    usage_key = get_usage_key(request, sid)
-    used_count = get_query_count(usage_key)
+    allowed, retry_after = rate_limit_check(
+        _chat_rate_windows,
+        get_rate_key(request, sid),
+        CHAT_RATE_LIMIT_COUNT,
+        CHAT_RATE_LIMIT_WINDOW_SECONDS,
+    )
+    if not allowed:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": f"Too many messages too quickly. Please wait about {retry_after} seconds and try again.",
+            },
+            status_code=429,
+        )
 
-    sess = get_session(sid)
     history = sess["history"]
     platform = sess["platform"]
 
@@ -465,9 +662,7 @@ def chat_api(payload: ChatIn, request: Request):
         input_messages: List[dict] = [{"role": "system", "content": system_text}]
 
         if platform:
-            input_messages.append(
-                {"role": "system", "content": f"User is on {platform}."}
-            )
+            input_messages.append({"role": "system", "content": f"User is on {platform}."})
 
         for turn in history[-MAX_HISTORY:]:
             input_messages.append(turn)
@@ -485,12 +680,23 @@ def chat_api(payload: ChatIn, request: Request):
         else:
             input_messages.append({"role": "user", "content": user_text})
 
+        logger.info(
+            "Chat request | sid=%s ip=%s logged_in=%s has_image=%s platform=%s",
+            sid,
+            get_client_ip(request),
+            is_logged_in(request, sid),
+            bool(image_url),
+            platform,
+        )
+
         ai_response = get_client().responses.create(
             model="gpt-4.1-mini",
             input=input_messages,
         )
 
-        answer = ai_response.output_text or ""
+        answer = (ai_response.output_text or "").strip()
+        if not answer:
+            answer = "I had trouble answering that. Please try again."
 
         if message:
             history.append({"role": "user", "content": message})
@@ -502,11 +708,9 @@ def chat_api(payload: ChatIn, request: Request):
 
         resp = JSONResponse(
             {
+                "ok": True,
                 "answer": answer,
                 "logged_in": is_logged_in(request, sid),
-                "used_count": used_count,
-                "free_limit": MAX_FREE_QUERIES,
-                "remaining_free": max(0, MAX_FREE_QUERIES - used_count),
             }
         )
         set_sid_cookie(resp, sid)
@@ -515,17 +719,32 @@ def chat_api(payload: ChatIn, request: Request):
     except HTTPException:
         raise
     except Exception:
+        logger.exception("AI service error | sid=%s ip=%s", sid, get_client_ip(request))
         resp = JSONResponse(
-            {"error": "AI service error. Please try again."},
+            {"ok": False, "error": "AI service error. Please try again."},
             status_code=502,
         )
         set_sid_cookie(resp, sid)
         return resp
 
 
+# -------------------------
+# Health endpoints
+# -------------------------
 @app.get("/ping")
 def ping():
     return {"ok": True}
+
+
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "service": "parable-portal",
+        "time": int(now_ts()),
+        "sessions": len(sessions),
+        "authed_sessions": len(_authed_sids),
+    }
 
 
 # -------------------------
@@ -538,12 +757,19 @@ def home():
     <p><a href="/dashboard">Go to Dashboard</a></p>
     <p><a href="/chat">Go to Chat</a></p>
     <p><a href="/ping">Ping Test</a></p>
+    <p><a href="/health">Health Check</a></p>
     """
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    return """
+def dashboard(request: Request):
+    sid = get_sid(request)
+    if not is_logged_in(request, sid):
+        resp = RedirectResponse(url="/chat", status_code=302)
+        set_sid_cookie(resp, sid)
+        return resp
+
+    html = """
     <h1>Customer Dashboard</h1>
     <ul>
       <li>📱 Smartphone Insurance: Active</li>
@@ -554,6 +780,9 @@ def dashboard():
     <p><a href="/chat">Open Chatbot</a></p>
     <p><a href="/">Back Home</a></p>
     """
+    resp = HTMLResponse(html)
+    set_sid_cookie(resp, sid)
+    return resp
 
 
 # -------------------------
@@ -566,290 +795,474 @@ def chat_page(request: Request):
 
     html = f"""
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+  />
   <title>Parable Chat</title>
   <link rel="manifest" href="/manifest.webmanifest">
   <meta name="theme-color" content="#ea580c">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <link rel="apple-touch-icon" href="/static/icon-192.png">
+
   <style>
     :root {{
-      --navy:#020617;
-      --orange:#ea580c;
-      --bg:#f4f6fb;
-      --card:#fff;
-      --soft:#f8fafc;
-      --line:#e5e7eb;
-      --danger:#b91c1c;
+      --navy: #020617;
+      --orange: #ea580c;
+      --bg: #f4f6fb;
+      --card: #ffffff;
+      --soft: #f8fafc;
+      --line: #e5e7eb;
+      --danger: #b91c1c;
+      --text: #111827;
+      --muted: #475569;
     }}
-    * {{ box-sizing:border-box; }}
+
+    * {{
+      box-sizing: border-box;
+    }}
+
+    html, body {{
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      max-width: 100%;
+      height: 100%;
+      overflow-x: hidden;
+    }}
+
     body {{
-      font-family:system-ui,-apple-system,"Segoe UI",Arial,sans-serif;
-      background:radial-gradient(1200px 600px at 50% 0%, #fff 0%, var(--bg) 55%);
-      margin:0;
+      font-family: system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
+      background: radial-gradient(1200px 600px at 50% 0%, #ffffff 0%, var(--bg) 55%);
+      color: var(--text);
+      -webkit-text-size-adjust: 100%;
+      overscroll-behavior-x: none;
     }}
+
+    img {{
+      max-width: 100%;
+      height: auto;
+    }}
+
+    .page {{
+      width: 100%;
+      max-width: 100%;
+      min-height: 100dvh;
+      overflow-x: hidden;
+      padding: 12px;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+    }}
+
     .wrap {{
-      max-width:920px;
-      margin:0 auto;
-      padding:28px 16px 40px;
+      width: 100%;
+      max-width: 920px;
+      margin: 0 auto;
     }}
+
     .card {{
-      background:var(--card);
-      border-radius:18px;
-      padding:18px;
-      box-shadow:0 14px 40px rgba(2,6,23,.10);
-      border:2px solid rgba(234,88,12,.55);
-      position:relative;
+      width: 100%;
+      max-width: 100%;
+      background: var(--card);
+      border-radius: 18px;
+      padding: 16px;
+      box-shadow: 0 14px 40px rgba(2, 6, 23, 0.10);
+      border: 2px solid rgba(234, 88, 12, 0.55);
+      position: relative;
+      overflow: hidden;
     }}
-    .card:before {{
-      content:"";
-      position:absolute;
-      inset:10px;
-      border-radius:14px;
-      border:1px solid rgba(234,88,12,.22);
-      pointer-events:none;
+
+    .card::before {{
+      content: "";
+      position: absolute;
+      inset: 10px;
+      border-radius: 14px;
+      border: 1px solid rgba(234, 88, 12, 0.22);
+      pointer-events: none;
     }}
+
     h1 {{
-      margin:0 0 6px;
-      font-size:22px;
-      color:var(--navy);
-      letter-spacing:.2px;
+      margin: 0 0 6px;
+      font-size: 22px;
+      color: var(--navy);
+      letter-spacing: 0.2px;
+      overflow-wrap: break-word;
+      word-break: break-word;
     }}
+
     .sub {{
-      margin:0 0 14px;
-      color:#475569;
+      margin: 0;
+      color: var(--muted);
+      overflow-wrap: break-word;
+      word-break: break-word;
     }}
+
+    .welcome {{
+      margin: 0 0 14px;
+      padding: 14px 16px;
+      background: #fff7ed;
+      border: 1px solid rgba(234, 88, 12, 0.25);
+      border-radius: 14px;
+      color: var(--navy);
+      font-weight: 700;
+      text-align: center;
+      overflow-wrap: break-word;
+      word-break: break-word;
+    }}
+
     .topbar {{
-      display:flex;
-      justify-content:space-between;
-      align-items:center;
-      gap:10px;
-      margin-bottom:12px;
-      flex-wrap:wrap;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 10px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
     }}
+
+    .topbar > div {{
+      min-width: 0;
+    }}
+
     .status {{
-      font-size:14px;
-      color:#475569;
+      font-size: 14px;
+      color: var(--muted);
+      overflow-wrap: break-word;
+      word-break: break-word;
     }}
+
     .smallbtn {{
-      padding:8px 12px;
-      border-radius:10px;
-      border:1px solid var(--line);
-      background:#fff;
-      cursor:pointer;
-      font-weight:600;
+      padding: 8px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: #ffffff;
+      cursor: pointer;
+      font-weight: 600;
+      color: var(--text);
     }}
+
     .chatbox {{
-      height:520px;
-      overflow:auto;
-      background:linear-gradient(180deg,#fff 0%,#fbfbfd 100%);
-      border:1px solid var(--line);
-      border-radius:14px;
-      padding:12px;
+      width: 100%;
+      max-width: 100%;
+      height: min(58dvh, 520px);
+      min-height: 320px;
+      overflow-y: auto;
+      overflow-x: hidden;
+      -webkit-overflow-scrolling: touch;
+      background: linear-gradient(180deg, #ffffff 0%, #fbfbfd 100%);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      word-break: break-word;
+      overflow-wrap: break-word;
     }}
+
     .row {{
-      display:flex;
-      margin:10px 0;
+      display: flex;
+      margin: 10px 0;
+      width: 100%;
+      max-width: 100%;
     }}
+
     .bubble {{
-      padding:10px 12px;
-      border-radius:14px;
-      max-width:85%;
-      white-space:pre-wrap;
-      line-height:1.35;
+      padding: 10px 12px;
+      border-radius: 14px;
+      max-width: 85%;
+      white-space: pre-wrap;
+      line-height: 1.35;
+      overflow-wrap: break-word;
+      word-wrap: break-word;
+      word-break: break-word;
     }}
+
     .you {{
-      justify-content:flex-end;
+      justify-content: flex-end;
     }}
+
     .you .bubble {{
-      background:var(--navy);
-      color:#fff;
+      background: var(--navy);
+      color: #ffffff;
     }}
+
     .bot {{
-      justify-content:flex-start;
+      justify-content: flex-start;
     }}
+
     .bot .bubble {{
-      background:var(--soft);
-      color:#111827;
-      border:1px solid rgba(234,88,12,.22);
+      background: var(--soft);
+      color: var(--text);
+      border: 1px solid rgba(234, 88, 12, 0.22);
     }}
+
     .quick {{
-      display:flex;
-      gap:8px;
-      flex-wrap:wrap;
-      margin:10px 0 0;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 10px 0 0;
+      width: 100%;
+      max-width: 100%;
     }}
+
     .q {{
-      padding:8px 10px;
-      border-radius:999px;
-      border:1px solid var(--line);
-      background:#fff;
-      color:var(--navy);
-      cursor:pointer;
-      font-weight:600;
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #ffffff;
+      color: var(--navy);
+      cursor: pointer;
+      font-weight: 600;
+      max-width: 100%;
     }}
+
     .q:hover {{
-      border-color:var(--orange);
+      border-color: var(--orange);
     }}
+
     .controls {{
-      display:flex;
-      gap:10px;
-      margin-top:12px;
-      align-items:center;
-      flex-wrap:wrap;
+      display: flex;
+      gap: 10px;
+      margin-top: 12px;
+      align-items: stretch;
+      flex-wrap: wrap;
+      width: 100%;
+      max-width: 100%;
     }}
+
+    .controls > * {{
+      min-width: 0;
+    }}
+
     input#msg,
     input.login-input {{
-      flex:1;
-      padding:12px;
-      border-radius:14px;
-      border:1px solid #d1d5db;
-      outline:none;
-      width:100%;
-      min-width:220px;
+      flex: 1 1 220px;
+      min-width: 0;
+      width: 100%;
+      max-width: 100%;
+      padding: 12px;
+      border-radius: 14px;
+      border: 1px solid #d1d5db;
+      outline: none;
+      font-size: 16px;
     }}
+
     input#msg:focus,
     input.login-input:focus {{
-      border-color:rgba(234,88,12,.8);
-      box-shadow:0 0 0 4px rgba(234,88,12,.15);
+      border-color: rgba(234, 88, 12, 0.8);
+      box-shadow: 0 0 0 4px rgba(234, 88, 12, 0.15);
     }}
+
     button.action {{
-      min-width:110px;
-      padding:11px 16px;
-      border-radius:12px;
-      border:1px solid rgba(234,88,12,.35);
-      background:var(--orange);
-      color:#fff;
-      cursor:pointer;
-      font-weight:700;
+      min-width: 110px;
+      padding: 11px 16px;
+      border-radius: 12px;
+      border: 1px solid rgba(234, 88, 12, 0.35);
+      background: var(--orange);
+      color: #ffffff;
+      cursor: pointer;
+      font-weight: 700;
+      flex-shrink: 0;
     }}
+
     button.action:disabled {{
-      opacity:.45;
-      cursor:not-allowed;
+      opacity: 0.45;
+      cursor: not-allowed;
     }}
+
     .iconbtn {{
-      min-width:56px;
-      padding:11px 12px;
-      border-radius:12px;
-      border:1px solid rgba(234,88,12,.35);
-      background:#fff;
-      cursor:pointer;
-      font-weight:800;
-      color:var(--navy);
+      min-width: 56px;
+      padding: 11px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(234, 88, 12, 0.35);
+      background: #ffffff;
+      cursor: pointer;
+      font-weight: 800;
+      color: var(--navy);
+      flex-shrink: 0;
     }}
+
     .iconbtn:hover {{
-      border-color:var(--orange);
+      border-color: var(--orange);
     }}
+
     .overlay {{
-      position:fixed;
-      inset:0;
-      background:rgba(2,6,23,.55);
-      display:none;
-      align-items:center;
-      justify-content:center;
-      padding:16px;
-      z-index:9999;
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 6, 23, 0.55);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      z-index: 9999;
     }}
+
     .overlay.show {{
-      display:flex;
+      display: flex;
     }}
+
     .login-card {{
-      width:min(420px, 100%);
-      background:#fff;
-      border-radius:18px;
-      padding:18px;
-      box-shadow:0 20px 50px rgba(2,6,23,.25);
-      border:2px solid rgba(234,88,12,.35);
+      width: min(420px, 100%);
+      max-width: 100%;
+      background: #ffffff;
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 20px 50px rgba(2, 6, 23, 0.25);
+      border: 2px solid rgba(234, 88, 12, 0.35);
     }}
+
     .login-card h2 {{
-      margin:0 0 8px;
-      color:var(--navy);
-      font-size:20px;
+      margin: 0 0 8px;
+      color: var(--navy);
+      font-size: 20px;
     }}
+
     .login-card p {{
-      margin:0 0 12px;
-      color:#475569;
-      font-size:14px;
+      margin: 0 0 12px;
+      color: var(--muted);
+      font-size: 14px;
     }}
+
     .login-grid {{
-      display:grid;
-      gap:10px;
+      display: grid;
+      gap: 10px;
     }}
+
     .login-actions {{
-      display:flex;
-      gap:10px;
-      margin-top:12px;
-      flex-wrap:wrap;
+      display: flex;
+      gap: 10px;
+      margin-top: 12px;
+      flex-wrap: wrap;
     }}
+
     .error {{
-      color:var(--danger);
-      font-size:14px;
-      min-height:20px;
+      color: var(--danger);
+      font-size: 14px;
+      min-height: 20px;
+      overflow-wrap: break-word;
+      word-break: break-word;
     }}
+
     .preview {{
-      margin-top:10px;
-      display:none;
-      gap:10px;
-      align-items:center;
-      flex-wrap:wrap;
-      padding:10px;
-      border:1px dashed rgba(234,88,12,.35);
-      border-radius:12px;
-      background:#fff;
+      margin-top: 10px;
+      display: none;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      padding: 10px;
+      border: 1px dashed rgba(234, 88, 12, 0.35);
+      border-radius: 12px;
+      background: #ffffff;
+      width: 100%;
+      max-width: 100%;
+      overflow: hidden;
     }}
+
     .preview img {{
-      max-height:72px;
-      border-radius:10px;
-      border:1px solid var(--line);
+      max-height: 72px;
+      max-width: 100%;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      flex-shrink: 0;
     }}
+
     .muted {{
-      color:#64748b;
-      font-size:13px;
+      color: #64748b;
+      font-size: 13px;
+      overflow-wrap: break-word;
+      word-break: break-word;
+    }}
+
+    @media (max-width: 640px) {{
+      .page {{
+        padding: 8px;
+      }}
+
+      .card {{
+        padding: 12px;
+        border-radius: 14px;
+      }}
+
+      h1 {{
+        font-size: 20px;
+      }}
+
+      .chatbox {{
+        height: min(56dvh, 460px);
+        min-height: 280px;
+        padding: 10px;
+      }}
+
+      .bubble {{
+        max-width: 92%;
+      }}
+
+      .controls {{
+        gap: 8px;
+      }}
+
+      input#msg {{
+        flex: 1 1 100%;
+      }}
+
+      button.action {{
+        min-width: 96px;
+      }}
     }}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="card" id="card">
-      <div class="topbar">
-        <div>
-          <h1>Parable Chatbot</h1>
-          <p class="sub">Ask a question about your phone.</p>
+  <div class="page">
+    <div class="wrap">
+      <div class="card" id="card">
+        <div class="topbar">
+          <div>
+            <h1>Parable Chatbot</h1>
+            <p class="sub">Ask a question about your phone.</p>
+          </div>
+          <div>
+            <span id="loginStatus" class="status">{'Logged in' if logged_in else 'Not logged in'}</span>
+            <button id="openLoginBtn" class="smallbtn" type="button">{'Account' if logged_in else 'Log in'}</button>
+          </div>
         </div>
-        <div>
-          <span id="loginStatus" class="status">{'Logged in' if logged_in else 'Free mode'}</span>
-          <button id="openLoginBtn" class="smallbtn" type="button">{'Account' if logged_in else 'Log in'}</button>
+
+        <div class="welcome">Thank you, How can we help you today?</div>
+
+        <div id="usageStatus" class="status" style="margin-bottom:10px;"></div>
+
+        <div id="chatbox" class="chatbox"></div>
+
+        <div class="quick">
+          <button class="q" type="button" onclick="quick('iPhone')">I'm on iPhone</button>
+          <button class="q" type="button" onclick="quick('Android')">I'm on Android</button>
         </div>
-      </div>
 
-      <div id="usageStatus" class="status" style="margin-bottom:10px;"></div>
-
-      <div id="chatbox" class="chatbox"></div>
-
-      <div class="quick">
-        <button class="q" type="button" onclick="quick('iPhone')">I'm on iPhone</button>
-        <button class="q" type="button" onclick="quick('Android')">I'm on Android</button>
-      </div>
-
-      <div id="preview" class="preview">
-        <img id="previewImg" alt="preview" />
-        <div>
-          <div><strong>Photo ready to send</strong></div>
-          <div class="muted" id="previewNote">It will upload when you press Send.</div>
+        <div id="preview" class="preview">
+          <img id="previewImg" alt="preview" />
+          <div style="min-width:0;">
+            <div><strong>Photo ready to send</strong></div>
+            <div class="muted" id="previewNote">It will upload when you press Send.</div>
+          </div>
+          <button id="clearPhoto" class="smallbtn" type="button">Remove</button>
         </div>
-        <button id="clearPhoto" class="smallbtn" type="button">Remove</button>
-      </div>
 
-      <div class="controls">
-        <input id="msg" placeholder="Type here (or choose Voice first)..." />
-        <input id="photoInput" type="file" accept="image/*" style="display:none" />
-        <button id="attach" class="iconbtn" type="button" title="Upload photo">📎</button>
-        <button id="mic" class="action" type="button">🎤 Speak</button>
-        <button id="btn" class="action" type="button">Send</button>
+        <div class="controls">
+          <input
+            id="msg"
+            placeholder="Type here (or choose Voice first)..."
+            autocomplete="off"
+            autocapitalize="sentences"
+            autocorrect="on"
+            spellcheck="true"
+            maxlength="1500"
+          />
+          <input id="photoInput" type="file" accept="image/*" style="display:none" />
+          <button id="attach" class="iconbtn" type="button" title="Upload photo">📎</button>
+          <button id="mic" class="action" type="button">🎤 Speak</button>
+          <button id="btn" class="action" type="button">Send</button>
+        </div>
       </div>
     </div>
   </div>
@@ -857,11 +1270,32 @@ def chat_page(request: Request):
   <div id="loginOverlay" class="overlay">
     <div class="login-card">
       <h2>Log in</h2>
-      <p>Enter your username and password to keep chatting.</p>
+      <p>Enter your username and password.</p>
 
       <div class="login-grid">
-        <input id="loginUser" class="login-input" placeholder="Username" autocomplete="username" />
-        <input id="loginPass" class="login-input" type="password" placeholder="Password" autocomplete="current-password" />
+        <input
+          id="loginUser"
+          name="username"
+          class="login-input"
+          type="text"
+          placeholder="Username"
+          autocomplete="username"
+          autocapitalize="none"
+          autocorrect="off"
+          spellcheck="false"
+          inputmode="text"
+        />
+        <input
+          id="loginPass"
+          name="password"
+          class="login-input"
+          type="password"
+          placeholder="Password"
+          autocomplete="current-password"
+          autocapitalize="none"
+          autocorrect="off"
+          spellcheck="false"
+        />
       </div>
 
       <div id="loginError" class="error"></div>
@@ -913,7 +1347,7 @@ def chat_page(request: Request):
     const key = "parable_sid";
     let sid = localStorage.getItem(key);
     if (!sid || sid.length < 10) {{
-      sid = (crypto.randomUUID ? crypto.randomUUID() : (Date.now() + "-" + Math.random()));
+      sid = (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, "") : (Date.now() + "-" + Math.random()).replace(/[^a-zA-Z0-9-_]/g, ""));
       localStorage.setItem(key, sid);
     }}
     return sid;
@@ -921,13 +1355,7 @@ def chat_page(request: Request):
 
   function updateUsageUi(data) {{
     if (!data) return;
-
-    if (data.logged_in) {{
-      usageStatus.textContent = "Logged in account active.";
-      return;
-    }}
-
-    usageStatus.textContent = `Free questions left: ${{Math.max(0, data.remaining_free)}} of ${{data.free_limit}}`;
+    usageStatus.textContent = data.logged_in ? "Logged in account active." : "Chat is ready.";
   }}
 
   async function loadUsage() {{
@@ -945,8 +1373,12 @@ def chat_page(request: Request):
         updateUsageUi(data);
       }}
     }} catch (e) {{
-      console.error("Usage load failed", e);
+      console.error("Status load failed", e);
     }}
+  }}
+
+  function scrollChatToBottom() {{
+    chatbox.scrollTop = chatbox.scrollHeight;
   }}
 
   function addBubble(text, who) {{
@@ -959,7 +1391,7 @@ def chat_page(request: Request):
 
     row.appendChild(bubble);
     chatbox.appendChild(row);
-    chatbox.scrollTop = chatbox.scrollHeight;
+    scrollChatToBottom();
 
     if (who === "bot" && preferVoice === true) {{
       speak(text);
@@ -969,9 +1401,8 @@ def chat_page(request: Request):
   function greetOnce() {{
     if (greeted) return;
     greeted = true;
-    addBubble("Hi, and welcome to Parable Chat.", "bot");
-    addBubble("Would you like to use text or voice?", "bot");
-    addBubble("Tip: Tap 📎 to upload a photo (like an error message or scam pop-up).", "bot");
+    addBubble("Thank you, How can we help you today?", "bot");
+    addBubble("You can type, speak, or upload a photo.", "bot");
     btn.disabled = false;
     micBtn.disabled = false;
     input.focus();
@@ -1126,7 +1557,7 @@ def chat_page(request: Request):
   }}
 
   function updateLoginUi() {{
-    loginStatus.textContent = loggedIn ? "Logged in" : "Free mode";
+    loginStatus.textContent = loggedIn ? "Logged in" : "Not logged in";
     openLoginBtn.textContent = loggedIn ? "Account" : "Log in";
   }}
 
@@ -1162,9 +1593,15 @@ def chat_page(request: Request):
       loggedIn = true;
       updateLoginUi();
       hideLogin();
-      addBubble("You are logged in. You can keep chatting now.", "bot");
       loginPass.value = "";
       loadUsage();
+
+      if (data.redirect) {{
+        window.location.href = data.redirect;
+        return;
+      }}
+
+      addBubble("You are logged in.", "bot");
     }} catch (e) {{
       loginError.textContent = "Login error. Try again.";
     }}
@@ -1208,7 +1645,7 @@ def chat_page(request: Request):
 
     const data = await res.json();
     if (!res.ok || !data.ok) {{
-      addBubble(data.error || "Upload failed.", "bot");
+      addBubble(data.error || data.detail || "Upload failed.", "bot");
       return null;
     }}
 
@@ -1242,7 +1679,7 @@ def chat_page(request: Request):
 
       imgRow.appendChild(img);
       chatbox.appendChild(imgRow);
-      chatbox.scrollTop = chatbox.scrollHeight;
+      scrollChatToBottom();
     }}
 
     input.value = "";
@@ -1251,6 +1688,11 @@ def chat_page(request: Request):
 
     try {{
       const photoUrl = await uploadSelectedPhotoIfNeeded();
+
+      if (selectedFile && !photoUrl) {{
+        btn.disabled = false;
+        return;
+      }}
 
       const res = await fetch("/api/chat", {{
         method: "POST",
@@ -1264,13 +1706,6 @@ def chat_page(request: Request):
           image_url: photoUrl
         }})
       }});
-
-      if (res.status === 402) {{
-        addBubble("Free limit reached — please log in to continue.", "bot");
-        showLogin();
-        loadUsage();
-        return;
-      }}
 
       const data = await res.json();
       addBubble(data.answer || data.error || ("HTTP " + res.status), "bot");
