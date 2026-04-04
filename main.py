@@ -374,7 +374,6 @@ async def add_security_headers(request: Request, call_next):
 
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["X-Frame-Options"] = "SAMEORIGIN"
     response.headers["Permissions-Policy"] = "microphone=(self), camera=(), geolocation=()"
     response.headers["Cache-Control"] = "no-store" if is_api_path(request.url.path) else "public, max-age=300"
 
@@ -461,7 +460,7 @@ def login_api(payload: LoginIn, request: Request):
             {
                 "ok": True,
                 "message": "Logged in",
-                "redirect": "/chat",
+                "redirect": "/dashboard",
             }
         )
         set_sid_cookie(resp, sid)
@@ -633,6 +632,9 @@ def chat_api(payload: ChatIn, request: Request):
         platform = "android"
 
     try:
+        # FIX 4: Merge platform context into a single system message to avoid
+        # sending two "system" role entries, which some OpenAI models reject.
+        platform_note = f"\nUser is on {platform}." if platform else ""
         system_text = (
             "You are Parable Smartphone Support. Talk like a calm, friendly helper.\n"
             "Rules:\n"
@@ -650,8 +652,10 @@ def chat_api(payload: ChatIn, request: Request):
             "3) Then give 3 to 6 safe steps the user should do next.\n"
             "- If the screenshot is unreadable, say so and ask them to upload a clearer one.\n"
             "- End with: 'Did that work?' when appropriate.\n"
+            + platform_note
         )
 
+        # FIX 3: Ensure relative image URLs are made absolute before sending to OpenAI.
         if image_url and image_url.startswith("/"):
             image_url = str(request.base_url).rstrip("/") + image_url
 
@@ -659,10 +663,10 @@ def chat_api(payload: ChatIn, request: Request):
         if not user_text and image_url:
             user_text = "Please check this screenshot. Is it suspicious? What should I do?"
 
+        # FIX 1 & 2: Use chat.completions.create() with the correct message schema.
+        # Vision content blocks use type "text" / "image_url" (not "input_text" / "input_image"),
+        # and image_url must be a dict {"url": "..."}, not a bare string.
         input_messages: List[dict] = [{"role": "system", "content": system_text}]
-
-        if platform:
-            input_messages.append({"role": "system", "content": f"User is on {platform}."})
 
         for turn in history[-MAX_HISTORY:]:
             input_messages.append(turn)
@@ -672,8 +676,8 @@ def chat_api(payload: ChatIn, request: Request):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": user_text},
-                        {"type": "input_image", "image_url": image_url},
+                        {"type": "text", "text": user_text},
+                        {"type": "image_url", "image_url": {"url": image_url}},
                     ],
                 }
             )
@@ -689,12 +693,13 @@ def chat_api(payload: ChatIn, request: Request):
             platform,
         )
 
-        ai_response = get_client().responses.create(
-            model="gpt-4.1-mini",
-            input=input_messages,
+        # FIX 1: Use chat.completions.create() + messages= (not responses.create() + input=).
+        ai_response = get_client().chat.completions.create(
+            model="gpt-4o-mini",
+            messages=input_messages,
         )
 
-        answer = (ai_response.output_text or "").strip()
+        answer = (ai_response.choices[0].message.content or "").strip()
         if not answer:
             answer = "I had trouble answering that. Please try again."
 
@@ -751,14 +756,16 @@ def health():
 # Simple pages
 # -------------------------
 @app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-    <h1>Parable Portal ✅</h1>
-    <p><a href="/dashboard">Go to Dashboard</a></p>
-    <p><a href="/chat">Go to Chat</a></p>
-    <p><a href="/ping">Ping Test</a></p>
-    <p><a href="/health">Health Check</a></p>
-    """
+def home(request: Request):
+    sid = get_sid(request)
+    if is_logged_in(request, sid):
+        resp = RedirectResponse(url="/dashboard", status_code=302)
+        set_sid_cookie(resp, sid)
+        return resp
+
+    resp = RedirectResponse(url="/chat", status_code=302)
+    set_sid_cookie(resp, sid)
+    return resp
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -770,16 +777,296 @@ def dashboard(request: Request):
         return resp
 
     html = """
-    <h1>Customer Dashboard</h1>
-    <ul>
-      <li>📱 Smartphone Insurance: Active</li>
-      <li>🛡️ Antivirus: Active</li>
-      <li>🔒 VPN: Active</li>
-      <li>🧾 Identity Guard: Active</li>
-    </ul>
-    <p><a href="/chat">Open Chatbot</a></p>
-    <p><a href="/">Back Home</a></p>
-    """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+  />
+  <title>Parable Dashboard</title>
+  <meta name="theme-color" content="#ea580c">
+  <style>
+    :root {
+      --navy: #020617;
+      --orange: #ea580c;
+      --bg: #f4f6fb;
+      --card: #ffffff;
+      --soft: #fff7ed;
+      --line: #e5e7eb;
+      --text: #111827;
+      --muted: #475569;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      max-width: 100%;
+      min-height: 100%;
+      overflow-x: hidden;
+    }
+
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
+      background: radial-gradient(1200px 600px at 50% 0%, #ffffff 0%, var(--bg) 55%);
+      color: var(--text);
+      -webkit-text-size-adjust: 100%;
+    }
+
+    .page {
+      width: 100%;
+      min-height: 100dvh;
+      padding: 18px;
+      display: flex;
+      justify-content: center;
+    }
+
+    .wrap {
+      width: 100%;
+      max-width: 980px;
+    }
+
+    .card {
+      background: var(--card);
+      border-radius: 22px;
+      padding: 24px;
+      border: 2px solid rgba(234, 88, 12, 0.45);
+      box-shadow: 0 14px 40px rgba(2, 6, 23, 0.10);
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 18px;
+    }
+
+    .brand {
+      font-size: 20px;
+      font-weight: 800;
+      color: var(--navy);
+    }
+
+    .top-actions {
+      margin-left: auto;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .btn,
+    .btn-outline {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 56px;
+      padding: 14px 20px;
+      border-radius: 16px;
+      font-size: 20px;
+      font-weight: 800;
+      text-decoration: none;
+      cursor: pointer;
+      border: 1px solid rgba(234, 88, 12, 0.35);
+    }
+
+    .btn {
+      background: var(--orange);
+      color: #ffffff;
+    }
+
+    .btn-outline {
+      background: #ffffff;
+      color: var(--navy);
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 40px;
+      line-height: 1.15;
+      color: var(--navy);
+    }
+
+    .lead {
+      margin: 0 0 18px;
+      font-size: 21px;
+      line-height: 1.6;
+      color: var(--muted);
+    }
+
+    .welcome {
+      margin-bottom: 20px;
+      padding: 18px 20px;
+      border-radius: 18px;
+      background: var(--soft);
+      border: 1px solid rgba(234, 88, 12, 0.25);
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--navy);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin: 20px 0;
+    }
+
+    .tile {
+      display: block;
+      text-decoration: none;
+      color: inherit;
+      background: #ffffff;
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 24px;
+      box-shadow: 0 8px 22px rgba(2, 6, 23, 0.05);
+      min-height: 170px;
+    }
+
+    .tile:hover {
+      border-color: rgba(234, 88, 12, 0.45);
+    }
+
+    .tile-title {
+      margin: 0 0 10px;
+      font-size: 30px;
+      font-weight: 800;
+      color: var(--navy);
+    }
+
+    .tile-text {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.55;
+      color: var(--muted);
+    }
+
+    .footer-note {
+      margin-top: 24px;
+      font-size: 18px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    @media (max-width: 760px) {
+      .page {
+        padding: 12px;
+      }
+
+      .card {
+        padding: 18px;
+        border-radius: 18px;
+      }
+
+      h1 {
+        font-size: 32px;
+      }
+
+      .lead,
+      .welcome,
+      .tile-text,
+      .btn,
+      .btn-outline {
+        font-size: 19px;
+      }
+
+      .tile-title {
+        font-size: 25px;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .top-actions {
+        width: 100%;
+        margin-left: 0;
+      }
+
+      .btn,
+      .btn-outline {
+        width: 100%;
+      }
+
+      .tile {
+        min-height: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="wrap">
+      <div class="card">
+        <div class="topbar">
+          <div class="brand">Parable Smartphone</div>
+          <div class="top-actions">
+            <a class="btn" href="/chat">Open Chat</a>
+            <button class="btn-outline" id="logoutBtn" type="button">Log out</button>
+          </div>
+        </div>
+
+        <h1>Welcome to your Parable Dashboard</h1>
+        <p class="lead">Choose a big button below to get simple help fast.</p>
+
+        <div class="welcome">
+          Pick the area you want help with.
+        </div>
+
+        <div class="grid">
+          <a class="tile" href="/chat">
+            <div class="tile-title">Parable Chat</div>
+            <p class="tile-text">Ask any question, speak into the microphone, or get step-by-step help for your phone.</p>
+          </a>
+
+          <a class="tile" href="/chat?topic=I got a scam pop-up or suspicious message on my phone">
+            <div class="tile-title">ScamShield</div>
+            <p class="tile-text">Get help with scam pop-ups, fake messages, suspicious links, and phone safety concerns.</p>
+          </a>
+
+          <a class="tile" href="/chat?topic=I need smartphone help with my phone settings, sound, text size, storage, or apps">
+            <div class="tile-title">Smartphone Help</div>
+            <p class="tile-text">Get help fixing common phone problems like no sound, small text, full storage, or confusing settings.</p>
+          </a>
+
+          <a class="tile" href="/chat?topic=Tell me about Parable subscriptions and plans">
+            <div class="tile-title">Parable Subscriptions</div>
+            <p class="tile-text">Learn about Parable plans, support options, and what comes with your subscription.</p>
+          </a>
+        </div>
+
+        <p class="footer-note">
+          Need help right now? Tap <strong>Open Chat</strong> and tell us what is happening.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function logout() {
+      try {
+        await fetch("/api/logout", {
+          method: "POST",
+          credentials: "same-origin"
+        });
+      } catch (e) {
+        console.error("Logout failed", e);
+      }
+      window.location.href = "/chat";
+    }
+
+    document.getElementById("logoutBtn").addEventListener("click", logout);
+  </script>
+</body>
+</html>
+"""
     resp = HTMLResponse(html)
     set_sid_cookie(resp, sid)
     return resp
@@ -792,6 +1079,8 @@ def dashboard(request: Request):
 def chat_page(request: Request):
     sid = get_sid(request)
     logged_in = is_logged_in(request, sid)
+    topic = (request.query_params.get("topic") or "").strip()
+    safe_topic = topic.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
 
     html = f"""
 <!doctype html>
@@ -808,8 +1097,9 @@ def chat_page(request: Request):
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <link rel="apple-touch-icon" href="/static/icon-192.png">
-
   <style>
+    /* iOS Safari viewport height fix: set --vh via JS, fall back to 1vh */
+    :root {{ --vh: 1vh; }}
     :root {{
       --navy: #020617;
       --orange: #ea580c;
@@ -831,7 +1121,9 @@ def chat_page(request: Request):
       padding: 0;
       width: 100%;
       max-width: 100%;
-      height: 100%;
+      /* Do NOT set height:100% — it causes blank-page rendering in iOS in-app browsers
+         because the in-app browser viewport height is indeterminate at parse time.
+         min-height on .page handles the full-height layout instead. */
       overflow-x: hidden;
     }}
 
@@ -841,6 +1133,8 @@ def chat_page(request: Request):
       color: var(--text);
       -webkit-text-size-adjust: 100%;
       overscroll-behavior-x: none;
+      font-size: 20px;
+      line-height: 1.6;
     }}
 
     img {{
@@ -851,7 +1145,8 @@ def chat_page(request: Request):
     .page {{
       width: 100%;
       max-width: 100%;
-      min-height: 100dvh;
+      min-height: 100vh;
+      min-height: calc(var(--vh, 1vh) * 100);
       overflow-x: hidden;
       padding: 12px;
       display: flex;
@@ -861,34 +1156,40 @@ def chat_page(request: Request):
 
     .wrap {{
       width: 100%;
-      max-width: 920px;
+      max-width: 980px;
       margin: 0 auto;
+      display: flex;
     }}
 
     .card {{
       width: 100%;
       max-width: 100%;
       background: var(--card);
-      border-radius: 18px;
-      padding: 16px;
+      border-radius: 22px;
+      padding: 22px;
       box-shadow: 0 14px 40px rgba(2, 6, 23, 0.10);
       border: 2px solid rgba(234, 88, 12, 0.55);
       position: relative;
       overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: calc(100vh - 24px);
+      min-height: calc(var(--vh, 1vh) * 100 - 24px);
     }}
 
     .card::before {{
       content: "";
       position: absolute;
       inset: 10px;
-      border-radius: 14px;
+      border-radius: 16px;
       border: 1px solid rgba(234, 88, 12, 0.22);
       pointer-events: none;
     }}
 
     h1 {{
-      margin: 0 0 6px;
-      font-size: 22px;
+      margin: 0 0 8px;
+      font-size: 38px;
+      line-height: 1.15;
       color: var(--navy);
       letter-spacing: 0.2px;
       overflow-wrap: break-word;
@@ -898,18 +1199,21 @@ def chat_page(request: Request):
     .sub {{
       margin: 0;
       color: var(--muted);
+      font-size: 21px;
+      line-height: 1.6;
       overflow-wrap: break-word;
       word-break: break-word;
     }}
 
     .welcome {{
-      margin: 0 0 14px;
-      padding: 14px 16px;
+      margin: 0 0 16px;
+      padding: 18px 18px;
       background: #fff7ed;
       border: 1px solid rgba(234, 88, 12, 0.25);
-      border-radius: 14px;
+      border-radius: 16px;
       color: var(--navy);
-      font-weight: 700;
+      font-weight: 800;
+      font-size: 22px;
       text-align: center;
       overflow-wrap: break-word;
       word-break: break-word;
@@ -917,63 +1221,77 @@ def chat_page(request: Request):
 
     .topbar {{
       display: flex;
-      justify-content: space-between;
       align-items: flex-start;
-      gap: 10px;
-      margin-bottom: 12px;
+      gap: 12px;
+      margin-bottom: 14px;
       flex-wrap: wrap;
     }}
 
-    .topbar > div {{
+    .topbar-main {{
       min-width: 0;
+      flex: 1 1 auto;
+    }}
+
+    .topbar-actions {{
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
     }}
 
     .status {{
-      font-size: 14px;
+      font-size: 18px;
       color: var(--muted);
       overflow-wrap: break-word;
       word-break: break-word;
     }}
 
     .smallbtn {{
-      padding: 8px 12px;
-      border-radius: 10px;
+      min-height: 50px;
+      padding: 12px 16px;
+      border-radius: 12px;
       border: 1px solid var(--line);
       background: #ffffff;
       cursor: pointer;
-      font-weight: 600;
+      font-weight: 700;
+      font-size: 18px;
       color: var(--text);
     }}
 
     .chatbox {{
       width: 100%;
       max-width: 100%;
-      height: min(58dvh, 520px);
-      min-height: 320px;
+      min-height: 260px;
+      flex: 1 1 auto;
       overflow-y: auto;
       overflow-x: hidden;
       -webkit-overflow-scrolling: touch;
       background: linear-gradient(180deg, #ffffff 0%, #fbfbfd 100%);
       border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 12px;
+      border-radius: 16px;
+      padding: 14px;
       word-break: break-word;
       overflow-wrap: break-word;
+      font-size: 20px;
+      line-height: 1.65;
     }}
 
     .row {{
       display: flex;
-      margin: 10px 0;
+      margin: 12px 0;
       width: 100%;
       max-width: 100%;
     }}
 
     .bubble {{
-      padding: 10px 12px;
-      border-radius: 14px;
-      max-width: 85%;
+      padding: 14px 16px;
+      border-radius: 16px;
+      max-width: 88%;
       white-space: pre-wrap;
-      line-height: 1.35;
+      line-height: 1.6;
+      font-size: 20px;
       overflow-wrap: break-word;
       word-wrap: break-word;
       word-break: break-word;
@@ -1000,21 +1318,22 @@ def chat_page(request: Request):
 
     .quick {{
       display: flex;
-      gap: 8px;
+      gap: 10px;
       flex-wrap: wrap;
-      margin: 10px 0 0;
+      margin: 12px 0 0;
       width: 100%;
       max-width: 100%;
     }}
 
     .q {{
-      padding: 8px 10px;
+      padding: 12px 16px;
       border-radius: 999px;
       border: 1px solid var(--line);
       background: #ffffff;
       color: var(--navy);
       cursor: pointer;
-      font-weight: 600;
+      font-weight: 700;
+      font-size: 18px;
       max-width: 100%;
     }}
 
@@ -1025,7 +1344,7 @@ def chat_page(request: Request):
     .controls {{
       display: flex;
       gap: 10px;
-      margin-top: 12px;
+      margin-top: 14px;
       align-items: stretch;
       flex-wrap: wrap;
       width: 100%;
@@ -1038,15 +1357,16 @@ def chat_page(request: Request):
 
     input#msg,
     input.login-input {{
-      flex: 1 1 220px;
+      flex: 1 1 240px;
       min-width: 0;
       width: 100%;
       max-width: 100%;
-      padding: 12px;
-      border-radius: 14px;
+      padding: 16px;
+      border-radius: 16px;
       border: 1px solid #d1d5db;
       outline: none;
-      font-size: 16px;
+      font-size: 20px;
+      line-height: 1.4;
     }}
 
     input#msg:focus,
@@ -1056,14 +1376,16 @@ def chat_page(request: Request):
     }}
 
     button.action {{
-      min-width: 110px;
-      padding: 11px 16px;
-      border-radius: 12px;
+      min-width: 118px;
+      min-height: 56px;
+      padding: 14px 18px;
+      border-radius: 14px;
       border: 1px solid rgba(234, 88, 12, 0.35);
       background: var(--orange);
       color: #ffffff;
       cursor: pointer;
-      font-weight: 700;
+      font-weight: 800;
+      font-size: 19px;
       flex-shrink: 0;
     }}
 
@@ -1073,13 +1395,15 @@ def chat_page(request: Request):
     }}
 
     .iconbtn {{
-      min-width: 56px;
-      padding: 11px 12px;
-      border-radius: 12px;
+      min-width: 58px;
+      min-height: 56px;
+      padding: 12px 14px;
+      border-radius: 14px;
       border: 1px solid rgba(234, 88, 12, 0.35);
       background: #ffffff;
       cursor: pointer;
       font-weight: 800;
+      font-size: 22px;
       color: var(--navy);
       flex-shrink: 0;
     }}
@@ -1104,11 +1428,11 @@ def chat_page(request: Request):
     }}
 
     .login-card {{
-      width: min(420px, 100%);
+      width: min(460px, 100%);
       max-width: 100%;
       background: #ffffff;
-      border-radius: 18px;
-      padding: 18px;
+      border-radius: 20px;
+      padding: 22px;
       box-shadow: 0 20px 50px rgba(2, 6, 23, 0.25);
       border: 2px solid rgba(234, 88, 12, 0.35);
     }}
@@ -1116,44 +1440,47 @@ def chat_page(request: Request):
     .login-card h2 {{
       margin: 0 0 8px;
       color: var(--navy);
-      font-size: 20px;
+      font-size: 30px;
+      line-height: 1.2;
     }}
 
     .login-card p {{
-      margin: 0 0 12px;
+      margin: 0 0 14px;
       color: var(--muted);
-      font-size: 14px;
+      font-size: 19px;
+      line-height: 1.6;
     }}
 
     .login-grid {{
       display: grid;
-      gap: 10px;
+      gap: 12px;
     }}
 
     .login-actions {{
       display: flex;
       gap: 10px;
-      margin-top: 12px;
+      margin-top: 14px;
       flex-wrap: wrap;
     }}
 
     .error {{
       color: var(--danger);
-      font-size: 14px;
-      min-height: 20px;
+      font-size: 17px;
+      min-height: 24px;
+      margin-top: 8px;
       overflow-wrap: break-word;
       word-break: break-word;
     }}
 
     .preview {{
-      margin-top: 10px;
+      margin-top: 12px;
       display: none;
       gap: 10px;
       align-items: center;
       flex-wrap: wrap;
-      padding: 10px;
+      padding: 12px;
       border: 1px dashed rgba(234, 88, 12, 0.35);
-      border-radius: 12px;
+      border-radius: 14px;
       background: #ffffff;
       width: 100%;
       max-width: 100%;
@@ -1161,7 +1488,7 @@ def chat_page(request: Request):
     }}
 
     .preview img {{
-      max-height: 72px;
+      max-height: 80px;
       max-width: 100%;
       border-radius: 10px;
       border: 1px solid var(--line);
@@ -1170,9 +1497,26 @@ def chat_page(request: Request):
 
     .muted {{
       color: #64748b;
-      font-size: 13px;
+      font-size: 16px;
+      line-height: 1.5;
       overflow-wrap: break-word;
       word-break: break-word;
+    }}
+
+    /* Desktop: cap the card height and enable internal scroll so it fits in the browser window */
+    @media (min-width: 641px) {{
+      .page {{
+        align-items: stretch;
+      }}
+
+      .card {{
+        max-height: calc(100vh - 24px);
+        max-height: calc(var(--vh, 1vh) * 100 - 24px);
+      }}
+
+      .chatbox {{
+        overflow-y: auto;
+      }}
     }}
 
     @media (max-width: 640px) {{
@@ -1181,22 +1525,35 @@ def chat_page(request: Request):
       }}
 
       .card {{
-        padding: 12px;
-        border-radius: 14px;
+        padding: 14px;
+        border-radius: 16px;
+        min-height: calc(100vh - 16px);
+        min-height: calc(var(--vh, 1vh) * 100 - 16px);
+        /* No max-height on mobile — iOS in-app browsers miscalculate dvh */
       }}
 
       h1 {{
-        font-size: 20px;
+        font-size: 30px;
+      }}
+
+      .sub,
+      .welcome,
+      .status,
+      .bubble,
+      .q,
+      .smallbtn,
+      .login-card p,
+      .muted {{
+        font-size: 18px;
       }}
 
       .chatbox {{
-        height: min(56dvh, 460px);
-        min-height: 280px;
-        padding: 10px;
+        min-height: 220px;
+        padding: 12px;
       }}
 
       .bubble {{
-        max-width: 92%;
+        max-width: 94%;
       }}
 
       .controls {{
@@ -1208,7 +1565,13 @@ def chat_page(request: Request):
       }}
 
       button.action {{
-        min-width: 96px;
+        min-width: 100px;
+      }}
+
+      .topbar-actions {{
+        width: 100%;
+        margin-left: 0;
+        justify-content: flex-end;
       }}
     }}
   </style>
@@ -1218,25 +1581,25 @@ def chat_page(request: Request):
     <div class="wrap">
       <div class="card" id="card">
         <div class="topbar">
-          <div>
-            <h1>Parable Chatbot</h1>
+          <div class="topbar-main">
+            <h1>Parable Chat</h1>
             <p class="sub">Ask a question about your phone.</p>
           </div>
-          <div>
+          <div class="topbar-actions">
             <span id="loginStatus" class="status">{'Logged in' if logged_in else 'Not logged in'}</span>
-            <button id="openLoginBtn" class="smallbtn" type="button">{'Account' if logged_in else 'Log in'}</button>
+            <button id="openLoginBtn" class="smallbtn" type="button">{'Dashboard' if logged_in else 'Log in'}</button>
           </div>
         </div>
 
-        <div class="welcome">Thank you, How can we help you today?</div>
+        <div class="welcome">Thank you. How can we help you today?</div>
 
         <div id="usageStatus" class="status" style="margin-bottom:10px;"></div>
 
         <div id="chatbox" class="chatbox"></div>
 
         <div class="quick">
-          <button class="q" type="button" onclick="quick('iPhone')">I'm on iPhone</button>
-          <button class="q" type="button" onclick="quick('Android')">I'm on Android</button>
+          <button class="q" type="button" onclick="quick('I am on iPhone')">I'm on iPhone</button>
+          <button class="q" type="button" onclick="quick('I am on Android')">I'm on Android</button>
         </div>
 
         <div id="preview" class="preview">
@@ -1251,7 +1614,7 @@ def chat_page(request: Request):
         <div class="controls">
           <input
             id="msg"
-            placeholder="Type here (or choose Voice first)..."
+            placeholder="Type here or choose Voice..."
             autocomplete="off"
             autocapitalize="sentences"
             autocorrect="on"
@@ -1336,6 +1699,7 @@ def chat_page(request: Request):
   let selectedVoice = null;
   let micReady = false;
   let loggedIn = {str(logged_in).lower()};
+  let initialTopic = '{safe_topic}';
 
   let selectedFile = null;
   let uploadedUrl = null;
@@ -1347,7 +1711,9 @@ def chat_page(request: Request):
     const key = "parable_sid";
     let sid = localStorage.getItem(key);
     if (!sid || sid.length < 10) {{
-      sid = (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, "") : (Date.now() + "-" + Math.random()).replace(/[^a-zA-Z0-9-_]/g, ""));
+      sid = (crypto.randomUUID
+        ? crypto.randomUUID().replace(/-/g, "")
+        : (Date.now() + "-" + Math.random()).replace(/[^a-zA-Z0-9-_]/g, ""));
       localStorage.setItem(key, sid);
     }}
     return sid;
@@ -1401,7 +1767,6 @@ def chat_page(request: Request):
   function greetOnce() {{
     if (greeted) return;
     greeted = true;
-    addBubble("Thank you, How can we help you today?", "bot");
     addBubble("You can type, speak, or upload a photo.", "bot");
     btn.disabled = false;
     micBtn.disabled = false;
@@ -1558,7 +1923,7 @@ def chat_page(request: Request):
 
   function updateLoginUi() {{
     loginStatus.textContent = loggedIn ? "Logged in" : "Not logged in";
-    openLoginBtn.textContent = loggedIn ? "Account" : "Log in";
+    openLoginBtn.textContent = loggedIn ? "Dashboard" : "Log in";
   }}
 
   async function submitLogin() {{
@@ -1669,8 +2034,8 @@ def chat_page(request: Request):
 
       const img = document.createElement("img");
       img.src = URL.createObjectURL(selectedFile);
-      img.style.maxWidth = "140px";
-      img.style.maxHeight = "160px";
+      img.style.maxWidth = "160px";
+      img.style.maxHeight = "180px";
       img.style.objectFit = "cover";
       img.style.borderRadius = "12px";
       img.style.border = "1px solid #e5e7eb";
@@ -1742,7 +2107,7 @@ def chat_page(request: Request):
 
   openLoginBtn.addEventListener("click", () => {{
     if (loggedIn) {{
-      addBubble("You are already logged in.", "bot");
+      window.location.href = "/dashboard";
       return;
     }}
     showLogin();
@@ -1781,11 +2146,28 @@ def chat_page(request: Request):
     updateLoginUi();
     greetOnce();
     loadUsage();
+
+    if (initialTopic) {{
+      setTimeout(() => {{
+        input.value = initialTopic;
+        send();
+      }}, 450);
+    }}
   }});
 
   if ("serviceWorker" in navigator) {{
     navigator.serviceWorker.register("/static/sw.js");
   }}
+
+  // iOS Safari / in-app browser viewport height fix.
+  // 100dvh and 100vh can both be wrong inside WKWebView; --vh gives us the real value.
+  function setVh() {{
+    const vh = window.innerHeight * 0.01;
+    document.documentElement.style.setProperty("--vh", `${{vh}}px`);
+  }}
+  setVh();
+  window.addEventListener("resize", setVh);
+  window.addEventListener("orientationchange", () => setTimeout(setVh, 200));
 </script>
 </body>
 </html>
