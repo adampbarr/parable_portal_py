@@ -2433,54 +2433,36 @@ def chat_page(request: Request):
     return voices.find(v => (v.lang || "").startsWith("en")) || voices[0];
   }
 
-  function speakCleanText(raw) {
-    // Turn step-format text into something that sounds natural when read aloud.
-    let t = (raw || "").trim();
-    // Strip markdown-style bold/italic markers
-    t = t.replace(/\*{1,3}([^*]+)\*{1,3}/g, "$1");
-    // Turn numbered list items ("1. Do this" / "1) Do this") into plain sentences
-    t = t.replace(/^\d+[.)]\s*/gm, "");
-    // Turn bullet dashes / asterisks into natural pauses
-    t = t.replace(/^[\-\u2022\*]\s*/gm, "");
-    // Turn setting paths like "Settings > Accessibility > Zoom" into spoken form
-    t = t.replace(/\s*>\s*/g, ", then ");
-    // Collapse multiple newlines into a period + space (sentence break)
-    t = t.replace(/\\n{2,}/g, ". ");
-    // Single newlines become a short pause (comma)
-    t = t.replace(/\\n/g, ", ");
-    // Clean up doubled punctuation from the replacements above
-    t = t.replace(/[.,]{2,}/g, ".").replace(/,\s*\./g, ".").replace(/\.\s*,/g, ".");
-    // Collapse whitespace
-    t = t.replace(/\s+/g, " ").trim();
-    return t;
-  }
-
   function speak(text) {
     if (!("speechSynthesis" in window)) return;
     window.speechSynthesis.cancel();
     if (!selectedVoice) {
       selectedVoice = pickVoice();
     }
-    const cleaned = speakCleanText(text);
-    // Split into sentences so the synthesizer can breathe between them.
-    // This avoids the monotone run-on that makes TTS sound robotic.
-    const sentences = cleaned.match(/[^.!?]+[.!?]+/g) || [cleaned];
-    // Cap total spoken length — read at most ~500 chars so it stays useful
-    let charBudget = 500;
-    for (const sentence of sentences) {
-      const s = sentence.trim();
-      if (!s) continue;
-      if (charBudget <= 0) break;
-      charBudget -= s.length;
-      const u = new SpeechSynthesisUtterance(s);
-      if (selectedVoice) {
-        u.voice = selectedVoice;
-      }
-      u.rate = 0.92;
-      u.pitch = 1.0;
-      u.volume = 1.0;
-      window.speechSynthesis.speak(u);
+    // Clean up text so it sounds natural when read aloud
+    var t = (text || "").trim();
+    t = t.replace(/\\n+/g, ". ");
+    t = t.replace(/\\s+/g, " ");
+    // Strip markdown bold/italic
+    t = t.replace(/[*_]{1,3}/g, "");
+    // Remove numbered list prefixes
+    t = t.replace(/\\d+[.)]/g, "");
+    // Remove bullet dashes
+    t = t.replace(/ - /g, ", ");
+    // Turn setting paths into spoken form
+    t = t.replace(/ > /g, ", then ");
+    t = t.trim();
+    if (t.length > 500) {
+      t = t.slice(0, 500) + "...";
     }
+    var u = new SpeechSynthesisUtterance(t);
+    if (selectedVoice) {
+      u.voice = selectedVoice;
+    }
+    u.rate = 0.92;
+    u.pitch = 1.0;
+    u.volume = 1.0;
+    window.speechSynthesis.speak(u);
   }
 
   if ("speechSynthesis" in window) {
