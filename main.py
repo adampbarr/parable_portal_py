@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from contextlib import contextmanager
@@ -13,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -737,6 +738,10 @@ class ChatIn(BaseModel):
     image_url: Optional[str] = None
 
 
+class SpeakIn(BaseModel):
+    text: str = Field(..., min_length=1, max_length=2000)
+
+
 class LoginIn(BaseModel):
     username: str = Field(..., min_length=1, max_length=128)
     password: str = Field(..., min_length=1, max_length=256)
@@ -1396,6 +1401,52 @@ def chat_api(payload: ChatIn, request: Request):
         resp = JSONResponse({"ok": False, "error": "AI service error. Please try again."}, status_code=502)
         set_sid_cookie(resp, sid)
         return resp
+
+
+# -------------------------
+# Text-to-speech endpoint
+# -------------------------
+@app.post("/api/speak")
+def speak_api(payload: SpeakIn, request: Request):
+    sid = get_sid(request)
+
+    text = (payload.text or "").strip()
+    if not text:
+        return JSONResponse({"ok": False, "error": "Text required."}, status_code=400)
+
+    # Clean up text so TTS reads it naturally.
+    text = re.sub(r"[*_`]{1,3}", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 1500:
+        text = text[:1500]
+
+    allowed, retry_after = rate_limit_check(
+        _chat_rate_windows,
+        get_rate_key(request, sid),
+        CHAT_RATE_LIMIT_COUNT,
+        CHAT_RATE_LIMIT_WINDOW_SECONDS,
+    )
+    if not allowed:
+        return JSONResponse(
+            {"ok": False, "error": f"Too many requests. Wait about {retry_after} seconds."},
+            status_code=429,
+        )
+
+    try:
+        tts = get_client().audio.speech.create(
+            model="tts-1",
+            voice="nova",
+            input=text,
+            response_format="mp3",
+        )
+        audio_bytes = tts.read() if hasattr(tts, "read") else tts.content
+        resp = Response(content=audio_bytes, media_type="audio/mpeg")
+        resp.headers["Cache-Control"] = "no-store"
+        set_sid_cookie(resp, sid)
+        return resp
+    except Exception:
+        logger.exception("TTS service error | sid=%s ip=%s", sid, get_client_ip(request))
+        return JSONResponse({"ok": False, "error": "Voice service error."}, status_code=502)
 
 
 # -------------------------
@@ -2433,36 +2484,61 @@ def chat_page(request: Request):
     return voices.find(v => (v.lang || "").startsWith("en")) || voices[0];
   }
 
-  function speak(text) {
+  // Shared <audio> element so mobile WebViews unlock it on user tap.
+  var ttsAudio = null;
+  function getTtsAudio() {
+    if (!ttsAudio) {
+      ttsAudio = new Audio();
+      ttsAudio.preload = "auto";
+    }
+    return ttsAudio;
+  }
+
+  function speakFallback(text) {
     if (!("speechSynthesis" in window)) return;
     window.speechSynthesis.cancel();
-    if (!selectedVoice) {
-      selectedVoice = pickVoice();
-    }
-    // Clean up text so it sounds natural when read aloud
+    if (!selectedVoice) { selectedVoice = pickVoice(); }
     var t = (text || "").trim();
-    t = t.replace(/\\n+/g, ". ");
-    t = t.replace(/\\s+/g, " ");
-    // Strip markdown bold/italic
-    t = t.replace(/[*_]{1,3}/g, "");
-    // Remove numbered list prefixes
-    t = t.replace(/\\d+[.)]/g, "");
-    // Remove bullet dashes
-    t = t.replace(/ - /g, ", ");
-    // Turn setting paths into spoken form
-    t = t.replace(/ > /g, ", then ");
-    t = t.trim();
-    if (t.length > 500) {
-      t = t.slice(0, 500) + "...";
-    }
+    if (t.length > 500) { t = t.slice(0, 500) + "..."; }
     var u = new SpeechSynthesisUtterance(t);
-    if (selectedVoice) {
-      u.voice = selectedVoice;
-    }
-    u.rate = 0.92;
+    if (selectedVoice) { u.voice = selectedVoice; }
+    u.rate = 0.95;
     u.pitch = 1.0;
     u.volume = 1.0;
     window.speechSynthesis.speak(u);
+  }
+
+  async function speak(text) {
+    var t = (text || "").trim();
+    if (!t) return;
+    if (t.length > 1500) { t = t.slice(0, 1500); }
+    try {
+      var res = await fetch("/api/speak", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Parable-SID": getOrCreateSid()
+        },
+        credentials: "same-origin",
+        body: JSON.stringify({ text: t })
+      });
+      if (!res.ok) {
+        speakFallback(t);
+        return;
+      }
+      var blob = await res.blob();
+      var url = URL.createObjectURL(blob);
+      var audio = getTtsAudio();
+      try { audio.pause(); } catch (e) {}
+      audio.src = url;
+      audio.onended = function () { URL.revokeObjectURL(url); };
+      var playPromise = audio.play();
+      if (playPromise && typeof playPromise.catch === "function") {
+        playPromise.catch(function () { speakFallback(t); });
+      }
+    } catch (e) {
+      speakFallback(t);
+    }
   }
 
   if ("speechSynthesis" in window) {
@@ -2711,6 +2787,25 @@ def chat_page(request: Request):
   micBtn.addEventListener("click", async () => {
     greetOnce();
     preferVoice = true;
+    // Unlock audio on mobile — iOS/Android WebViews require the first
+    // audio playback to happen directly inside a user-tap handler.
+    try {
+      var a = getTtsAudio();
+      a.muted = true;
+      var p = a.play();
+      if (p && typeof p.then === "function") {
+        p.then(function () { a.pause(); a.muted = false; })
+         .catch(function () { a.muted = false; });
+      } else {
+        a.pause();
+        a.muted = false;
+      }
+    } catch (e) {}
+    if ("speechSynthesis" in window) {
+      var warmup = new SpeechSynthesisUtterance("");
+      warmup.volume = 0;
+      window.speechSynthesis.speak(warmup);
+    }
     await startMic();
   });
 
