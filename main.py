@@ -2484,15 +2484,42 @@ def chat_page(request: Request):
     return voices.find(v => (v.lang || "").startsWith("en")) || voices[0];
   }
 
-  // Shared <audio> element so mobile WebViews unlock it on user tap.
-  var ttsAudio = null;
-  function getTtsAudio() {
-    if (!ttsAudio) {
-      ttsAudio = new Audio();
-      ttsAudio.preload = "auto";
+  // Web Audio path — works in iOS WKWebView / Android WebView where
+  // HTMLAudioElement.play() outside a direct user gesture is blocked.
+  var audioCtx = null;
+  var currentSource = null;
+
+  function getAudioCtx() {
+    if (!audioCtx) {
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return null;
+      audioCtx = new Ctor();
     }
-    return ttsAudio;
+    return audioCtx;
   }
+
+  function unlockAudio() {
+    var ctx = getAudioCtx();
+    if (!ctx) return;
+    if (ctx.state === "suspended" && typeof ctx.resume === "function") {
+      ctx.resume().catch(function () {});
+    }
+    try {
+      var buf = ctx.createBuffer(1, 1, 22050);
+      var src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      if (typeof src.start === "function") { src.start(0); }
+      else if (typeof src.noteOn === "function") { src.noteOn(0); }
+    } catch (e) {}
+  }
+
+  // Called by the Android native shell from inside the mic-tap gesture,
+  // since the native hook preventDefaults the web mic handler.
+  window.nativeVoiceUnlock = function () {
+    preferVoice = true;
+    unlockAudio();
+  };
 
   function speakFallback(text) {
     if (!("speechSynthesis" in window)) return;
@@ -2508,10 +2535,28 @@ def chat_page(request: Request):
     window.speechSynthesis.speak(u);
   }
 
+  function debugBubble(msg) {
+    var row = document.createElement("div");
+    row.className = "row bot";
+    var bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.style.fontSize = "14px";
+    bubble.style.opacity = "0.7";
+    bubble.textContent = "[debug] " + msg;
+    row.appendChild(bubble);
+    chatbox.appendChild(row);
+    scrollChatToBottom();
+  }
+
   async function speak(text) {
     var t = (text || "").trim();
     if (!t) return;
     if (t.length > 1500) { t = t.slice(0, 1500); }
+
+    debugBubble("speak() called, preferVoice=" + preferVoice);
+
+    // Step 1: fetch TTS audio from server
+    var blob;
     try {
       var res = await fetch("/api/speak", {
         method: "POST",
@@ -2522,22 +2567,76 @@ def chat_page(request: Request):
         credentials: "same-origin",
         body: JSON.stringify({ text: t })
       });
+      debugBubble("fetch status=" + res.status + " type=" + res.headers.get("content-type"));
       if (!res.ok) {
+        debugBubble("fetch failed, trying fallback");
         speakFallback(t);
         return;
       }
-      var blob = await res.blob();
+      blob = await res.blob();
+      debugBubble("blob size=" + blob.size + " type=" + blob.type);
+    } catch (e) {
+      debugBubble("fetch error: " + e.message);
+      speakFallback(t);
+      return;
+    }
+
+    // Step 2: try HTMLAudioElement (works when mediaPlaybackRequiresUserGesture=false)
+    try {
       var url = URL.createObjectURL(blob);
-      var audio = getTtsAudio();
-      try { audio.pause(); } catch (e) {}
-      audio.src = url;
+      var audio = new Audio(url);
       audio.onended = function () { URL.revokeObjectURL(url); };
-      var playPromise = audio.play();
-      if (playPromise && typeof playPromise.catch === "function") {
-        playPromise.catch(function () { speakFallback(t); });
+      audio.onerror = function () {
+        debugBubble("Audio element error: " + (audio.error ? audio.error.message : "unknown"));
+      };
+      var playResult = audio.play();
+      if (playResult && typeof playResult.then === "function") {
+        playResult.then(function () {
+          debugBubble("Audio element playing OK");
+        }).catch(function (err) {
+          debugBubble("Audio element blocked: " + err.message + ", trying AudioContext");
+          tryAudioContext(blob, t);
+        });
+      } else {
+        debugBubble("Audio element play() returned sync (old browser)");
       }
     } catch (e) {
-      speakFallback(t);
+      debugBubble("Audio element error: " + e.message + ", trying AudioContext");
+      tryAudioContext(blob, t);
+    }
+  }
+
+  async function tryAudioContext(blob, fallbackText) {
+    var ctx = getAudioCtx();
+    if (!ctx) {
+      debugBubble("no AudioContext, using speechSynthesis");
+      speakFallback(fallbackText);
+      return;
+    }
+    try {
+      debugBubble("AudioContext state=" + ctx.state);
+      if (ctx.state === "suspended") {
+        try { await ctx.resume(); } catch (e) {}
+        debugBubble("AudioContext after resume=" + ctx.state);
+      }
+      var arrayBuf = await blob.arrayBuffer();
+      var decoded = await new Promise(function (resolve, reject) {
+        try {
+          var p = ctx.decodeAudioData(arrayBuf, resolve, reject);
+          if (p && typeof p.then === "function") { p.then(resolve, reject); }
+        } catch (e) { reject(e); }
+      });
+      debugBubble("decoded: duration=" + decoded.duration.toFixed(1) + "s");
+      try { if (currentSource) { currentSource.stop(); } } catch (e) {}
+      var source = ctx.createBufferSource();
+      source.buffer = decoded;
+      source.connect(ctx.destination);
+      currentSource = source;
+      source.start(0);
+      debugBubble("AudioContext source started");
+    } catch (e) {
+      debugBubble("AudioContext failed: " + e.message + ", using speechSynthesis");
+      speakFallback(fallbackText);
     }
   }
 
@@ -2776,7 +2875,10 @@ def chat_page(request: Request):
     send();
   }
 
-  btn.addEventListener("click", send);
+  btn.addEventListener("click", () => {
+    if (preferVoice) { unlockAudio(); }
+    send();
+  });
 
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
@@ -2787,20 +2889,9 @@ def chat_page(request: Request):
   micBtn.addEventListener("click", async () => {
     greetOnce();
     preferVoice = true;
-    // Unlock audio on mobile — iOS/Android WebViews require the first
-    // audio playback to happen directly inside a user-tap handler.
-    try {
-      var a = getTtsAudio();
-      a.muted = true;
-      var p = a.play();
-      if (p && typeof p.then === "function") {
-        p.then(function () { a.pause(); a.muted = false; })
-         .catch(function () { a.muted = false; });
-      } else {
-        a.pause();
-        a.muted = false;
-      }
-    } catch (e) {}
+    // Unlock the AudioContext inside the user gesture so deferred
+    // TTS playback works in iOS WKWebView and Android WebView.
+    unlockAudio();
     if ("speechSynthesis" in window) {
       var warmup = new SpeechSynthesisUtterance("");
       warmup.volume = 0;
